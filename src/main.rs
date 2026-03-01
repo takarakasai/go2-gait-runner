@@ -196,8 +196,9 @@ USAGE:
 MODES:
   dump            Offline: assert the gait stays within Go2 joint limits.
   intent          Offline: quantify forward displacement, foot sweep, lift.
-  run    <iface>  Hardware: ramp to stance -> in-place -> forward -> fold.
-  diag   <iface>  Hardware: same motion, log cmd-vs-measured + body tilt.
+  run    <iface>  Hardware: ramp -> in-place -> forward -> fold; reads state
+                  back and prints a tracking-error + body-tilt summary.
+  diag   <iface>  Alias for `run` (identical behaviour).
 
 FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --misa PATH       model .misa file        (default models/unitree_go2/go2.misa)
@@ -211,7 +212,7 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --four-support F  4-support fraction 0..1  (default: crawl preset)
   --ff              enable body-weight support feedforward      [run/diag]
   --ff-scale S      scale FF to real mass    (default 1.0)       [run/diag]
-  --csv PATH        write full per-tick telemetry CSV           [diag]
+  --csv PATH        write full per-tick telemetry CSV           [run/diag]
   -h, --help        show this help
 
 EXAMPLE (validated on slippery flooring):
@@ -280,11 +281,11 @@ fn main() {
             let ff = cli.flag("ff") || cli.flag("grav-ff");
             let ff_scale = cli.f64("ff-scale").unwrap_or(1.0);
             let csv = cli.str("csv");
-            let res = if mode == "run" {
-                run_hardware(&iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale)
-            } else {
-                run_diag(&iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale, csv)
-            };
+            // `run` and `diag` are the same path now; both always read state back
+            // and print the tracking/tilt summary. `diag` is kept as an alias.
+            let res = run_hardware(
+                &iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale, csv,
+            );
             if let Err(e) = res {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -636,175 +637,22 @@ fn wait_for_start_pose(reader: &unitree_go2::Reader<LowState>) -> Result<[f64; 1
     }
 }
 
-/// Drive the LinearCrawl gait on the real robot via rt/lowcmd at 500 Hz.
+/// Drive the LinearCrawl gait on the real robot via rt/lowcmd at 500 Hz, while
+/// reading state back from `rt/lowstate`.
 ///
 /// Phases (all low-level; sport_mode must already be OFF):
 ///   A. ramp the captured start pose into the gait's nominal stance (kp 0→kp)
 ///   B. hold in place (vx=0) for `inplace_secs`
 ///   C. if `vx_target > 0`: accelerate to vx_target, hold `forward_secs`, decelerate
 ///   D. fold to the lying pose for a safe exit
+///
+/// Each B/C tick records the measured joint angles and body roll/pitch, and a
+/// per-joint tracking-error + body-tilt summary is printed at the end (use it to
+/// size kp/kd: large stance tracking error ⇒ the legs sag under load ⇒ raise kp).
+/// With `csv_path` set, every recorded tick is also written as a full-telemetry
+/// CSV row. Both the `run` and `diag` CLI modes call this single path.
 #[allow(clippy::too_many_arguments)]
 fn run_hardware(
-    iface: &str,
-    misa_path: &str,
-    vx_target: f64,
-    inplace_secs: f64,
-    forward_secs: f64,
-    kp: f32,
-    kd: f32,
-    tune: GaitTune,
-    ff: bool,
-    ff_scale: f64,
-) -> Result<(), String> {
-    let swing_h = tune.swing_h;
-    let (model, home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
-    let weight = body_weight_n(&model) * ff_scale;
-    let com = misarta::centroidal::compute_com(&model, &home_q);
-    let com_xy = (com.x, com.y);
-
-    // Nominal stance (Go2 order): the pose the gait holds at vx=0. Sample it
-    // with one tick, then reset so the real loop starts from a clean phase.
-    ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
-    let stance = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
-    ctrl.reset();
-
-    eprintln!(
-        "go2-gait-runner: LinearCrawl  vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale} CoM=({:.3},{:.3})",
-        tune.cycle_s, tune.four_support, com.x, com.y
-    );
-    eprintln!("  ensure sport_mode is OFF (go2_motion_ctrl release {iface}) and the area is clear ...");
-
-    // ── DDS endpoints ──────────────────────────────────────────────────────
-    let dp = Participant::new(0, Some(iface)).map_err(|e| format!("participant: {e}"))?;
-    let cmd_topic = dp
-        .create_topic::<unitree_go2::LowCmd>(topics::LOW_CMD)
-        .map_err(|e| format!("cmd topic: {e}"))?;
-    let writer = dp
-        .create_writer(&cmd_topic, WriterQos::low_level_default())
-        .map_err(|e| format!("writer: {e}"))?;
-    let state_topic = dp
-        .create_topic::<LowState>(topics::LOW_STATE)
-        .map_err(|e| format!("state topic: {e}"))?;
-    let reader = dp
-        .create_reader(&state_topic, ReaderQos::low_level_default())
-        .map_err(|e| format!("reader: {e}"))?;
-
-    let start = wait_for_start_pose(&reader)?;
-    eprintln!(
-        "start pose captured: FR=[{:.3},{:.3},{:.3}] stance FR=[{:.3},{:.3},{:.3}]",
-        start[0], start[1], start[2], stance[0], stance[1], stance[2]
-    );
-
-    // ── 500 Hz emit closure (set 12 motors, CRC, write, pace to cadence) ───
-    let mut cmd = init_lowcmd();
-    let loop_start = Instant::now();
-    let mut tick: u64 = 0;
-    let mut emit = |q: &[f64; 12], tau: &[f64; 12], kp: f32, kd: f32| -> Result<(), String> {
-        for j in 0..joint::NUM_LEG_JOINTS {
-            let m = &mut cmd.motor_cmd[j];
-            m.q = q[j] as f32;
-            m.dq = 0.0;
-            m.kp = kp;
-            m.kd = kd;
-            m.tau = tau[j] as f32;
-        }
-        set_crc(&mut cmd);
-        writer.write(&cmd).map_err(|e| format!("write: {e}"))?;
-        tick += 1;
-        let next = loop_start + Duration::from_secs_f64(CONTROL_DT * tick as f64);
-        if let Some(d) = next.checked_duration_since(Instant::now()) {
-            std::thread::sleep(d);
-        }
-        Ok(())
-    };
-
-    let ticks = |secs: f64| -> u64 { (secs / CONTROL_DT).round().max(1.0) as u64 };
-
-    // Per gait tick: advance the controller, map to Go2 order, and (if enabled)
-    // compute the body-weight support feedforward from the stance set.
-    macro_rules! gait_step {
-        ($kp:expr, $kd:expr) => {{
-            let out = ctrl.tick(CONTROL_DT);
-            let q = output_to_go2(&out, &signs)?;
-            let tau = if ff {
-                support_tau_go2(&out, ctrl.kinematics(), &signs, weight, com_xy)
-            } else {
-                ZERO_TAU
-            };
-            emit(&q, &tau, $kp, $kd)?;
-        }};
-    }
-
-    // ── Phase A: ramp start → stance, kp 0 → kp ────────────────────────────
-    eprintln!("phase A: ramp to stance ({RAMP_SECS}s)");
-    let ramp_n = ticks(RAMP_SECS);
-    for i in 0..ramp_n {
-        let p = i as f64 / ramp_n as f64;
-        let mut q = [0.0f64; 12];
-        for j in 0..12 {
-            q[j] = (1.0 - p) * start[j] + p * stance[j];
-        }
-        emit(&q, &ZERO_TAU, (kp as f64 * p) as f32, kd)?;
-    }
-
-    // ── Phase B: in-place (vx=0) ───────────────────────────────────────────
-    eprintln!("phase B: in-place vx=0 ({inplace_secs}s)");
-    ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
-    for _ in 0..ticks(inplace_secs) {
-        gait_step!(kp, kd);
-    }
-
-    // ── Phase C: forward crawl (accelerate, hold, decelerate) ──────────────
-    if vx_target > 0.0 {
-        eprintln!("phase C: forward to vx={vx_target} (accel {ACCEL_SECS}s, hold {forward_secs}s, decel {ACCEL_SECS}s)");
-        let accel_n = ticks(ACCEL_SECS);
-        for i in 0..accel_n {
-            let v = vx_target * (i as f64 / accel_n as f64);
-            ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
-            gait_step!(kp, kd);
-        }
-        ctrl.set_velocity_cmd(VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 });
-        for _ in 0..ticks(forward_secs) {
-            gait_step!(kp, kd);
-        }
-        for i in 0..accel_n {
-            let v = vx_target * (1.0 - i as f64 / accel_n as f64);
-            ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
-            gait_step!(kp, kd);
-        }
-        // settle in place briefly
-        ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
-        for _ in 0..ticks(0.5) {
-            gait_step!(kp, kd);
-        }
-    }
-
-    // ── Phase D: fold to lying pose for a safe exit ────────────────────────
-    eprintln!("phase D: fold to lying pose ({FOLD_SECS}s)");
-    let cur = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
-    let fold_n = ticks(FOLD_SECS);
-    for i in 0..fold_n {
-        let p = i as f64 / fold_n as f64;
-        let mut q = [0.0f64; 12];
-        for j in 0..12 {
-            q[j] = (1.0 - p) * cur[j] + p * LIE_POS[j];
-        }
-        emit(&q, &ZERO_TAU, kp, kd)?;
-    }
-    for _ in 0..ticks(0.5) {
-        emit(&LIE_POS, &ZERO_TAU, kp, kd)?;
-    }
-
-    eprintln!("done: gait complete, folded on the ground.");
-    Ok(())
-}
-
-/// Hardware diagnostic: run the same stance→in-place→forward→fold motion, but
-/// each tick read the measured joint angles and body roll/pitch back from
-/// `rt/lowstate` and report per-joint tracking error and body tilt. Use this to
-/// size kp/kd: large stance tracking error ⇒ the legs sag under load (raise kp).
-#[allow(clippy::too_many_arguments)]
-fn run_diag(
     iface: &str,
     misa_path: &str,
     vx_target: f64,
@@ -828,10 +676,10 @@ fn run_diag(
     ctrl.reset();
 
     eprintln!(
-        "diag: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale} CoM=({:.3},{:.3})",
+        "go2-gait-runner: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale} CoM=({:.3},{:.3})",
         tune.cycle_s, tune.four_support, com.x, com.y
     );
-    eprintln!("  sport_mode must be OFF; area clear ...");
+    eprintln!("  ensure sport_mode is OFF (go2_motion_ctrl release {iface}) and the area is clear ...");
 
     let dp = Participant::new(0, Some(iface)).map_err(|e| format!("participant: {e}"))?;
     let cmd_topic = dp
@@ -1052,21 +900,17 @@ fn run_diag(
     }
 
     // Summary.
-    let names = [
-        "FR_hip", "FR_thigh", "FR_calf", "FL_hip", "FL_thigh", "FL_calf", "RR_hip", "RR_thigh",
-        "RR_calf", "RL_hip", "RL_thigh", "RL_calf",
-    ];
-    eprintln!("\n=== diag summary over {n_rec} samples (B+C) ===");
+    eprintln!("\n=== summary over {n_rec} samples (B+C) ===");
     eprintln!("  per-joint tracking error |cmd-act| (rad): mean / max");
     for j in 0..12 {
         let mean = if n_rec > 0 { err_sum[j] / n_rec as f64 } else { 0.0 };
-        eprintln!("    {:<8} mean={mean:.4}  max={:.4}", names[j], err_max[j]);
+        eprintln!("    {:<8} mean={mean:.4}  max={:.4}", jnames[j], err_max[j]);
     }
     eprintln!(
         "  body tilt: max|roll|={roll_max:.3} rad ({:.1} deg)  max|pitch|={pitch_max:.3} rad ({:.1} deg)",
         roll_max.to_degrees(),
         pitch_max.to_degrees()
     );
-    eprintln!("done: diag complete, folded on the ground.");
+    eprintln!("done: gait complete, folded on the ground.");
     Ok(())
 }
