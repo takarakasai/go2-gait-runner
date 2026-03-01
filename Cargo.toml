@@ -1,0 +1,12 @@
+[package]
+name = "go2-gait-runner"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Headless runner: drive quadruped-gait on a real Unitree Go2 via unitree-sdk-rs."
+
+[dependencies]
+quadruped-gait = { path = "../quadruped-gait" }
+misarta = { path = "../misarta" }
+nalgebra = "0.34.2"
