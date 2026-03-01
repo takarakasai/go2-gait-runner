@@ -210,6 +210,7 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --swing H         foot lift height, m      (default 0.04)
   --cycle S         gait cycle period, s     (default: crawl preset)
   --four-support F  4-support fraction 0..1  (default: crawl preset)
+  --sway M          lateral body-sway amplitude, m (default 0 = off)
   --ff              enable body-weight support feedforward      [run/diag]
   --ff-scale S      scale FF to real mass    (default 1.0)       [run/diag]
   --csv PATH        write full per-tick telemetry CSV           [run/diag]
@@ -241,6 +242,7 @@ fn main() {
         swing_h: cli.f64("swing").unwrap_or(0.04),
         cycle_s: cli.f64("cycle"),
         four_support: cli.f64("four-support"),
+        sway: cli.f64("sway"),
     };
 
     match mode {
@@ -304,6 +306,8 @@ struct GaitTune {
     swing_h: f64,
     cycle_s: Option<f64>,
     four_support: Option<f64>,
+    /// Lateral body-sway amplitude (m). `None`/0 keeps the no-sway crawl.
+    sway: Option<f64>,
 }
 
 /// Zero feedforward torque.
@@ -328,6 +332,9 @@ fn build_gait(
     }
     if let Some(f) = tune.four_support {
         cfg = cfg.with_four_support_fraction(f);
+    }
+    if let Some(s) = tune.sway {
+        cfg = cfg.with_lateral_sway(s);
     }
     let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
     ctrl.set_knee_pattern(KneePattern::BothBack);
@@ -474,10 +481,11 @@ fn run_intent(misa_path: &str, vx: f64, tune: GaitTune) -> Result<(), String> {
         "intent: vx={vx} swing_h={swing_h} cycle={cycle:.3}s — expecting ~{:.3} m/cycle forward",
         vx * cycle
     );
-    eprintln!("t_s,body_x,FR_footx,FR_footz,FR_phase,FL_footz,RR_footz,RL_footz");
+    eprintln!("t_s,body_x,trunk_y,FR_footx,FR_footz,FR_phase,FL_footz,RR_footz,RL_footz");
 
     let mut x0 = None;
     let (mut fr_x_min, mut fr_x_max, mut fr_z_max) = (f64::MAX, f64::MIN, f64::MIN);
+    let (mut sway_min, mut sway_max) = (f64::MAX, f64::MIN);
     let mut last_x = 0.0;
     for step in 0..n {
         let out = ctrl.tick(CONTROL_DT);
@@ -487,6 +495,11 @@ fn run_intent(misa_path: &str, vx: f64, tune: GaitTune) -> Result<(), String> {
         }
         last_x = bx;
         let fr = out.leg(LegId::FR);
+        // The trunk shift equals (nominal − commanded) foot-body Y; with no
+        // sway it stays 0. Positive = trunk moved to body-left (+Y).
+        let by = ctrl.kinematics().fr.nominal_foot_body.y - fr.foot_body.y;
+        sway_min = sway_min.min(by);
+        sway_max = sway_max.max(by);
         fr_x_min = fr_x_min.min(fr.foot_body.x);
         fr_x_max = fr_x_max.max(fr.foot_body.x);
         // lift = how far the foot rises above its nominal stance z.
@@ -495,7 +508,7 @@ fn run_intent(misa_path: &str, vx: f64, tune: GaitTune) -> Result<(), String> {
         if step % 50 == 0 {
             let t = step as f64 * CONTROL_DT;
             eprintln!(
-                "{t:.3},{bx:.4},{:.4},{:+.4},{:?},{:+.4},{:+.4},{:+.4}",
+                "{t:.3},{bx:.4},{by:+.4},{:.4},{:+.4},{:?},{:+.4},{:+.4},{:+.4}",
                 fr.foot_body.x,
                 lift,
                 fr.phase,
@@ -505,6 +518,12 @@ fn run_intent(misa_path: &str, vx: f64, tune: GaitTune) -> Result<(), String> {
             );
         }
     }
+    eprintln!(
+        "  lateral sway (trunk_y): {:.4}..{:.4} m (peak-to-peak {:.4} m)",
+        sway_min,
+        sway_max,
+        sway_max - sway_min
+    );
     let net = last_x - x0.unwrap_or(0.0);
     eprintln!(
         "\nsummary: net body_x advance over {:.2}s = {net:.4} m ({:.4} m/cycle)",
