@@ -892,7 +892,7 @@ fn run_diag(
             let f = std::fs::File::create(p).map_err(|e| format!("csv create {p}: {e}"))?;
             let mut w = std::io::BufWriter::new(f);
             let mut hdr = String::from(
-                "phase,t_s,roll,pitch,yaw,gyro_x,gyro_y,gyro_z,acc_x,acc_y,acc_z,\
+                "t_s,phase,roll,pitch,yaw,gyro_x,gyro_y,gyro_z,acc_x,acc_y,acc_z,\
                  quat_w,quat_x,quat_y,quat_z,imu_temp,power_v,power_a,\
                  foot0,foot1,foot2,foot3",
             );
@@ -961,7 +961,7 @@ fn run_diag(
             if let Some(w) = csv.as_mut() {
                 let im = &s.imu_state;
                 let mut row = format!(
-                    "{phase},{t:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},\
+                    "{t:.4},{phase},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},\
                      {:.6},{:.6},{:.6},{:.6},{},{:.3},{:.3},{},{},{},{}",
                     im.rpy[0], im.rpy[1], im.rpy[2],
                     im.gyroscope[0], im.gyroscope[1], im.gyroscope[2],
@@ -999,6 +999,11 @@ fn run_diag(
         }};
     }
 
+    // Monotonic recorded-time offsets so the CSV's leading `t_s` runs
+    // continuously across phases B and C instead of resetting each phase.
+    let b_dur = ticks(inplace_secs) as f64 * CONTROL_DT;
+    let accel_dur = ticks(ACCEL_SECS) as f64 * CONTROL_DT;
+
     // Phase B: in-place (vx=0), recording.
     ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
     for i in 0..ticks(inplace_secs) {
@@ -1015,13 +1020,13 @@ fn run_diag(
             ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
-            record(&reader, &q, "C", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log, &mut csv)?;
+            record(&reader, &q, "C", b_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log, &mut csv)?;
         }
         ctrl.set_velocity_cmd(VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 });
         for i in 0..ticks(forward_secs) {
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
-            record(&reader, &q, "C", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log, &mut csv)?;
+            record(&reader, &q, "C", b_dur + accel_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log, &mut csv)?;
         }
         for i in 0..accel_n {
             let v = vx_target * (1.0 - i as f64 / accel_n as f64);
