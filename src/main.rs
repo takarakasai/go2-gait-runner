@@ -211,6 +211,7 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --four-support F  4-support fraction 0..1  (default: crawl preset)
   --ff              enable body-weight support feedforward      [run/diag]
   --ff-scale S      scale FF to real mass    (default 1.0)       [run/diag]
+  --csv PATH        write full per-tick telemetry CSV           [diag]
   -h, --help        show this help
 
 EXAMPLE (validated on slippery flooring):
@@ -267,7 +268,7 @@ fn main() {
                 eprintln!(
                     "usage: go2-gait-runner {mode} <iface> [--misa P] [--vx V] \
                      [--inplace S] [--forward S] [--kp K] [--kd K] [--swing H] \
-                     [--cycle S] [--four-support F] [--ff] [--ff-scale S]"
+                     [--cycle S] [--four-support F] [--ff] [--ff-scale S] [--csv PATH]"
                 );
                 std::process::exit(2);
             }
@@ -278,10 +279,11 @@ fn main() {
             let kd = cli.f32("kd").unwrap_or(5.0);
             let ff = cli.flag("ff") || cli.flag("grav-ff");
             let ff_scale = cli.f64("ff-scale").unwrap_or(1.0);
+            let csv = cli.str("csv");
             let res = if mode == "run" {
                 run_hardware(&iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale)
             } else {
-                run_diag(&iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale)
+                run_diag(&iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale, csv)
             };
             if let Err(e) = res {
                 eprintln!("error: {e}");
@@ -813,7 +815,9 @@ fn run_diag(
     tune: GaitTune,
     ff: bool,
     ff_scale: f64,
+    csv_path: Option<&str>,
 ) -> Result<(), String> {
+    use std::io::Write as _;
     let swing_h = tune.swing_h;
     let (model, home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
     let weight = body_weight_n(&model) * ff_scale;
@@ -876,6 +880,34 @@ fn run_diag(
     let mut pitch_max = 0.0f64;
     let mut sample_log = 0u64;
 
+    // Go2 motor order; reused for the CSV columns and the summary table.
+    let jnames = [
+        "FR_hip", "FR_thigh", "FR_calf", "FL_hip", "FL_thigh", "FL_calf", "RR_hip", "RR_thigh",
+        "RR_calf", "RL_hip", "RL_thigh", "RL_calf",
+    ];
+
+    // Optional full-telemetry CSV (one row per recorded tick, phases B+C).
+    let mut csv = match csv_path {
+        Some(p) => {
+            let f = std::fs::File::create(p).map_err(|e| format!("csv create {p}: {e}"))?;
+            let mut w = std::io::BufWriter::new(f);
+            let mut hdr = String::from(
+                "phase,t_s,roll,pitch,yaw,gyro_x,gyro_y,gyro_z,acc_x,acc_y,acc_z,\
+                 quat_w,quat_x,quat_y,quat_z,imu_temp,power_v,power_a,\
+                 foot0,foot1,foot2,foot3",
+            );
+            for nm in jnames.iter() {
+                hdr.push_str(&format!(",{nm}_cmd,{nm}_q,{nm}_dq,{nm}_tau"));
+            }
+            hdr.push('\n');
+            w.write_all(hdr.as_bytes())
+                .map_err(|e| format!("csv write: {e}"))?;
+            eprintln!("recording full telemetry CSV -> {p}");
+            Some(w)
+        }
+        None => None,
+    };
+
     // Phase A: ramp to stance.
     let ramp_n = ticks(RAMP_SECS);
     for i in 0..ramp_n {
@@ -899,7 +931,8 @@ fn run_diag(
                       n_rec: &mut u64,
                       roll_max: &mut f64,
                       pitch_max: &mut f64,
-                      sample_log: &mut u64|
+                      sample_log: &mut u64,
+                      csv: &mut Option<std::io::BufWriter<std::fs::File>>|
      -> Result<(), String> {
         if let Some(s) = reader.poll().map_err(|e| format!("poll: {e}"))? {
             for j in 0..joint::NUM_LEG_JOINTS {
@@ -922,6 +955,32 @@ fn run_diag(
                 );
             }
             *sample_log += 1;
+
+            // Full-telemetry CSV row: IMU, power, foot force, and per-joint
+            // commanded/measured position, velocity and estimated torque.
+            if let Some(w) = csv.as_mut() {
+                let im = &s.imu_state;
+                let mut row = format!(
+                    "{phase},{t:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},\
+                     {:.6},{:.6},{:.6},{:.6},{},{:.3},{:.3},{},{},{},{}",
+                    im.rpy[0], im.rpy[1], im.rpy[2],
+                    im.gyroscope[0], im.gyroscope[1], im.gyroscope[2],
+                    im.accelerometer[0], im.accelerometer[1], im.accelerometer[2],
+                    im.quaternion[0], im.quaternion[1], im.quaternion[2], im.quaternion[3],
+                    im.temperature, s.power_v, s.power_a,
+                    s.foot_force[0], s.foot_force[1], s.foot_force[2], s.foot_force[3],
+                );
+                for j in 0..12 {
+                    let m = &s.motor_state[j];
+                    row.push_str(&format!(
+                        ",{:.5},{:.5},{:.5},{:.4}",
+                        q_cmd[j], m.q, m.dq, m.tau_est
+                    ));
+                }
+                row.push('\n');
+                w.write_all(row.as_bytes())
+                    .map_err(|e| format!("csv write: {e}"))?;
+            }
         }
         Ok(())
     };
@@ -945,7 +1004,7 @@ fn run_diag(
     for i in 0..ticks(inplace_secs) {
         let (q, tau) = gait_qtau!();
         emit(&q, &tau, kp, kd)?;
-        record(&reader, &q, "B", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log)?;
+        record(&reader, &q, "B", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log, &mut csv)?;
     }
 
     // Phase C: forward, recording.
@@ -956,13 +1015,13 @@ fn run_diag(
             ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
-            record(&reader, &q, "C", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log)?;
+            record(&reader, &q, "C", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log, &mut csv)?;
         }
         ctrl.set_velocity_cmd(VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 });
         for i in 0..ticks(forward_secs) {
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
-            record(&reader, &q, "C", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log)?;
+            record(&reader, &q, "C", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log, &mut csv)?;
         }
         for i in 0..accel_n {
             let v = vx_target * (1.0 - i as f64 / accel_n as f64);
