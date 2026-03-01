@@ -154,12 +154,15 @@ fn main() {
             let kp: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(60.0);
             let kd: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(5.0);
             let swing_h: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(0.04);
+            let cycle_s: Option<f64> = rest.next().and_then(|s| s.parse().ok());
+            let four_support: Option<f64> = rest.next().and_then(|s| s.parse().ok());
             if iface.is_empty() || iface.ends_with(".misa") {
-                eprintln!("usage: go2-gait-runner run <iface> [misa_path] [vx] [inplace_secs] [forward_secs] [kp] [kd] [swing_h]");
+                eprintln!("usage: go2-gait-runner run <iface> [misa] [vx] [inplace_s] [forward_s] [kp] [kd] [swing_h] [cycle_s] [four_support]");
                 std::process::exit(2);
             }
+            let tune = GaitTune { swing_h, cycle_s, four_support };
             if let Err(e) =
-                run_hardware(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, swing_h)
+                run_hardware(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, tune)
             {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -170,7 +173,10 @@ fn main() {
             // intended forward displacement, foot sweep, and foot lift.
             let vx: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0.05);
             let swing_h: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0.04);
-            if let Err(e) = run_intent(&misa_path, vx, swing_h) {
+            let cycle_s: Option<f64> = args.next().and_then(|s| s.parse().ok());
+            let four_support: Option<f64> = args.next().and_then(|s| s.parse().ok());
+            let tune = GaitTune { swing_h, cycle_s, four_support };
+            if let Err(e) = run_intent(&misa_path, vx, tune) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -190,13 +196,14 @@ fn main() {
             let kp: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(60.0);
             let kd: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(5.0);
             let swing_h: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(0.04);
+            let cycle_s: Option<f64> = rest.next().and_then(|s| s.parse().ok());
+            let four_support: Option<f64> = rest.next().and_then(|s| s.parse().ok());
             if iface.is_empty() || iface.ends_with(".misa") {
-                eprintln!("usage: go2-gait-runner diag <iface> [misa] [vx] [inplace_secs] [forward_secs] [kp] [kd] [swing_h]");
+                eprintln!("usage: go2-gait-runner diag <iface> [misa] [vx] [inplace_s] [forward_s] [kp] [kd] [swing_h] [cycle_s] [four_support]");
                 std::process::exit(2);
             }
-            if let Err(e) =
-                run_diag(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, swing_h)
-            {
+            let tune = GaitTune { swing_h, cycle_s, four_support };
+            if let Err(e) = run_diag(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, tune) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -208,11 +215,16 @@ fn main() {
     }
 }
 
-/// Build the LinearCrawl controller and sign table from a `.misa` file.
-fn build_gait(
-    misa_path: &str,
+/// Gait tuning knobs shared by run/diag/intent. `None` keeps the crawl preset.
+#[derive(Clone, Copy)]
+struct GaitTune {
     swing_h: f64,
-) -> Result<(AnyGaitController, [[f64; 3]; 4]), String> {
+    cycle_s: Option<f64>,
+    four_support: Option<f64>,
+}
+
+/// Build the LinearCrawl controller and sign table from a `.misa` file.
+fn build_gait(misa_path: &str, tune: GaitTune) -> Result<(AnyGaitController, [[f64; 3]; 4]), String> {
     let parsed = misarta::native::load(misa_path).map_err(|e| format!("load {misa_path}: {e:?}"))?;
     let (model, _vis, _col) =
         misarta::native::build_model(&parsed.file).map_err(|e| format!("build_model: {e:?}"))?;
@@ -220,7 +232,13 @@ fn build_gait(
     let kin = auto_detect_kinematics_config(&model, &DEFAULT_FOOT_LINKS, &home_q)
         .map_err(|errs| format!("kinematics auto-detect failed: {errs:?}"))?;
     let signs = joint_signs(&model, &kin)?;
-    let cfg = GaitConfig::crawl().with_swing_height(swing_h);
+    let mut cfg = GaitConfig::crawl().with_swing_height(tune.swing_h);
+    if let Some(c) = tune.cycle_s {
+        cfg = cfg.with_cycle_period(c);
+    }
+    if let Some(f) = tune.four_support {
+        cfg = cfg.with_four_support_fraction(f);
+    }
     let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
     ctrl.set_knee_pattern(KneePattern::BothBack);
     Ok((ctrl, signs))
@@ -228,8 +246,9 @@ fn build_gait(
 
 /// Offline: quantify what the gait *intends* — per-cycle forward trunk
 /// displacement, the swing foot lift, and the stance foot fore/aft sweep.
-fn run_intent(misa_path: &str, vx: f64, swing_h: f64) -> Result<(), String> {
-    let (mut ctrl, _signs) = build_gait(misa_path, swing_h)?;
+fn run_intent(misa_path: &str, vx: f64, tune: GaitTune) -> Result<(), String> {
+    let swing_h = tune.swing_h;
+    let (mut ctrl, _signs) = build_gait(misa_path, tune)?;
     let cycle = ctrl.config().cycle_period_s;
     let n = ((2.5 * cycle) / CONTROL_DT).round() as usize; // ~2.5 cycles
     ctrl.set_velocity_cmd(VelocityCmd { vx, vy: 0.0, wz: 0.0 });
@@ -417,21 +436,10 @@ fn run_hardware(
     forward_secs: f64,
     kp: f32,
     kd: f32,
-    swing_h: f64,
+    tune: GaitTune,
 ) -> Result<(), String> {
-    // ── Build the gait (same pipeline as `dump`) ───────────────────────────
-    let parsed = misarta::native::load(misa_path).map_err(|e| format!("load {misa_path}: {e:?}"))?;
-    let (model, _vis, _col) =
-        misarta::native::build_model(&parsed.file).map_err(|e| format!("build_model: {e:?}"))?;
-    let home_q = build_home_q(&model);
-    let kin = auto_detect_kinematics_config(&model, &DEFAULT_FOOT_LINKS, &home_q)
-        .map_err(|errs| format!("kinematics auto-detect failed: {errs:?}"))?;
-    let signs = joint_signs(&model, &kin)?;
-    // crawl() defaults to a 5 mm swing (tuned for minimal trunk pitch); raise
-    // it so the swing feet actually clear the ground.
-    let cfg = GaitConfig::crawl().with_swing_height(swing_h);
-    let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
-    ctrl.set_knee_pattern(KneePattern::BothBack);
+    let swing_h = tune.swing_h;
+    let (mut ctrl, signs) = build_gait(misa_path, tune)?;
 
     // Nominal stance (Go2 order): the pose the gait holds at vx=0. Sample it
     // with one tick, then reset so the real loop starts from a clean phase.
@@ -440,7 +448,8 @@ fn run_hardware(
     ctrl.reset();
 
     eprintln!(
-        "go2-gait-runner: LinearCrawl  vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h}"
+        "go2-gait-runner: LinearCrawl  vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?}",
+        tune.cycle_s, tune.four_support
     );
     eprintln!("  ensure sport_mode is OFF (go2_motion_ctrl release {iface}) and the area is clear ...");
 
@@ -572,15 +581,17 @@ fn run_diag(
     forward_secs: f64,
     kp: f32,
     kd: f32,
-    swing_h: f64,
+    tune: GaitTune,
 ) -> Result<(), String> {
-    let (mut ctrl, signs) = build_gait(misa_path, swing_h)?;
+    let swing_h = tune.swing_h;
+    let (mut ctrl, signs) = build_gait(misa_path, tune)?;
     ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
     let stance = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
     ctrl.reset();
 
     eprintln!(
-        "diag: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h}"
+        "diag: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?}",
+        tune.cycle_s, tune.four_support
     );
     eprintln!("  sport_mode must be OFF; area clear ...");
 
