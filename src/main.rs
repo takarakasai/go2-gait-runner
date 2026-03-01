@@ -72,6 +72,11 @@ fn go2_motor_index(name: &str) -> Option<usize> {
     Some(base + off)
 }
 
+/// Parse a boolean-ish CLI flag.
+fn parse_flag(s: &str) -> bool {
+    matches!(s, "1" | "on" | "true" | "yes" | "ff" | "y")
+}
+
 /// 0 = hip, 1 = thigh, 2 = calf.
 fn joint_kind(name: &str) -> Option<usize> {
     if name.contains("hip") {
@@ -156,13 +161,14 @@ fn main() {
             let swing_h: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(0.04);
             let cycle_s: Option<f64> = rest.next().and_then(|s| s.parse().ok());
             let four_support: Option<f64> = rest.next().and_then(|s| s.parse().ok());
+            let ff = rest.next().map(|s| parse_flag(&s)).unwrap_or(false);
             if iface.is_empty() || iface.ends_with(".misa") {
-                eprintln!("usage: go2-gait-runner run <iface> [misa] [vx] [inplace_s] [forward_s] [kp] [kd] [swing_h] [cycle_s] [four_support]");
+                eprintln!("usage: go2-gait-runner run <iface> [misa] [vx] [inplace_s] [forward_s] [kp] [kd] [swing_h] [cycle_s] [four_support] [grav_ff]");
                 std::process::exit(2);
             }
             let tune = GaitTune { swing_h, cycle_s, four_support };
             if let Err(e) =
-                run_hardware(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, tune)
+                run_hardware(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, tune, ff)
             {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -198,12 +204,13 @@ fn main() {
             let swing_h: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(0.04);
             let cycle_s: Option<f64> = rest.next().and_then(|s| s.parse().ok());
             let four_support: Option<f64> = rest.next().and_then(|s| s.parse().ok());
+            let ff = rest.next().map(|s| parse_flag(&s)).unwrap_or(false);
             if iface.is_empty() || iface.ends_with(".misa") {
-                eprintln!("usage: go2-gait-runner diag <iface> [misa] [vx] [inplace_s] [forward_s] [kp] [kd] [swing_h] [cycle_s] [four_support]");
+                eprintln!("usage: go2-gait-runner diag <iface> [misa] [vx] [inplace_s] [forward_s] [kp] [kd] [swing_h] [cycle_s] [four_support] [grav_ff]");
                 std::process::exit(2);
             }
             let tune = GaitTune { swing_h, cycle_s, four_support };
-            if let Err(e) = run_diag(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, tune) {
+            if let Err(e) = run_diag(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, tune, ff) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -223,8 +230,15 @@ struct GaitTune {
     four_support: Option<f64>,
 }
 
-/// Build the LinearCrawl controller and sign table from a `.misa` file.
-fn build_gait(misa_path: &str, tune: GaitTune) -> Result<(AnyGaitController, [[f64; 3]; 4]), String> {
+/// Zero feedforward torque.
+const ZERO_TAU: [f64; 12] = [0.0; 12];
+
+/// Build the LinearCrawl controller plus the model (for the body weight),
+/// the standing `home_q`, and the IK→model sign table, from a `.misa` file.
+fn build_gait(
+    misa_path: &str,
+    tune: GaitTune,
+) -> Result<(Model<f64>, Vec<f64>, AnyGaitController, [[f64; 3]; 4]), String> {
     let parsed = misarta::native::load(misa_path).map_err(|e| format!("load {misa_path}: {e:?}"))?;
     let (model, _vis, _col) =
         misarta::native::build_model(&parsed.file).map_err(|e| format!("build_model: {e:?}"))?;
@@ -241,15 +255,85 @@ fn build_gait(misa_path: &str, tune: GaitTune) -> Result<(AnyGaitController, [[f
     }
     let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
     ctrl.set_knee_pattern(KneePattern::BothBack);
-    Ok((ctrl, signs))
+    Ok((model, home_q, ctrl, signs))
+}
+
+/// Total robot weight (N) = Σ link mass × g. The misarta Go2 model is
+/// fixed-base, so `compute_gravity` would only carry the leg-segment weight;
+/// the body-support load that actually makes the legs sag has to be applied as
+/// a distributed ground reaction (below).
+fn body_weight_n(model: &Model<f64>) -> f64 {
+    let m: f64 = model.inertias.iter().map(|i| i.mass).sum();
+    m * 9.81
+}
+
+fn leg_slot(leg: LegId) -> usize {
+    match leg {
+        LegId::FL => 0,
+        LegId::FR => 1,
+        LegId::RL => 2,
+        LegId::RR => 3,
+    }
+}
+
+fn leg_base_motor(leg: LegId) -> usize {
+    match leg {
+        LegId::FR => 0,
+        LegId::FL => 3,
+        LegId::RR => 6,
+        LegId::RL => 9,
+    }
+}
+
+/// Static body-weight support feedforward (Nm per Go2 motor). Distribute the
+/// total weight equally among the current stance feet as a vertical ground
+/// reaction `f = (0,0,Fz)` (body frame), convert to joint torques via the
+/// support relation `τ = −Jᵀ·f` (IK convention), then into the motor/model
+/// sign convention. Swing legs get zero. Clamped for safety.
+fn support_tau_go2(
+    out: &ControllerOutput,
+    kin: &quadruped_gait::KinematicsConfig,
+    signs: &[[f64; 3]; 4],
+    weight_n: f64,
+) -> [f64; 12] {
+    let n_stance = out.legs.iter().filter(|l| l.phase.is_stance).count().max(1);
+    let fz = weight_n / n_stance as f64;
+    let f = nalgebra::Vector3::new(0.0, 0.0, fz);
+    let mut tau = ZERO_TAU;
+    for l in out.legs.iter() {
+        if !l.phase.is_stance {
+            continue;
+        }
+        let jac = quadruped_gait::foot_jacobian_body(kin.leg(l.leg), l.q_hip, l.q_thigh, l.q_calf);
+        let tau_ik = -(jac.transpose() * f); // [hip, thigh, calf], IK convention
+        let slot = leg_slot(l.leg);
+        let base = leg_base_motor(l.leg);
+        for k in 0..3 {
+            tau[base + k] = (tau_ik[k] * signs[slot][k]).clamp(-18.0, 18.0);
+        }
+    }
+    tau
 }
 
 /// Offline: quantify what the gait *intends* — per-cycle forward trunk
 /// displacement, the swing foot lift, and the stance foot fore/aft sweep.
 fn run_intent(misa_path: &str, vx: f64, tune: GaitTune) -> Result<(), String> {
     let swing_h = tune.swing_h;
-    let (mut ctrl, _signs) = build_gait(misa_path, tune)?;
+    let (model, _home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
     let cycle = ctrl.config().cycle_period_s;
+
+    // Report the body-weight support FF at the nominal stance (all 4 legs
+    // down), so its sign and magnitude can be sanity-checked offline before
+    // sending to hardware.
+    let weight = body_weight_n(&model);
+    ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
+    let out0 = ctrl.tick(CONTROL_DT);
+    let gtau = support_tau_go2(&out0, ctrl.kinematics(), &signs, weight);
+    eprintln!(
+        "body weight = {weight:.1} N; stance support FF (Nm), Go2 order: FR[h,t,c]=[{:.2},{:.2},{:.2}] FL=[{:.2},{:.2},{:.2}] RR=[{:.2},{:.2},{:.2}] RL=[{:.2},{:.2},{:.2}]",
+        gtau[0], gtau[1], gtau[2], gtau[3], gtau[4], gtau[5], gtau[6], gtau[7], gtau[8], gtau[9], gtau[10], gtau[11]
+    );
+    ctrl.reset();
     let n = ((2.5 * cycle) / CONTROL_DT).round() as usize; // ~2.5 cycles
     ctrl.set_velocity_cmd(VelocityCmd { vx, vy: 0.0, wz: 0.0 });
 
@@ -437,9 +521,11 @@ fn run_hardware(
     kp: f32,
     kd: f32,
     tune: GaitTune,
+    ff: bool,
 ) -> Result<(), String> {
     let swing_h = tune.swing_h;
-    let (mut ctrl, signs) = build_gait(misa_path, tune)?;
+    let (model, _home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
+    let weight = body_weight_n(&model);
 
     // Nominal stance (Go2 order): the pose the gait holds at vx=0. Sample it
     // with one tick, then reset so the real loop starts from a clean phase.
@@ -448,7 +534,7 @@ fn run_hardware(
     ctrl.reset();
 
     eprintln!(
-        "go2-gait-runner: LinearCrawl  vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?}",
+        "go2-gait-runner: LinearCrawl  vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff}",
         tune.cycle_s, tune.four_support
     );
     eprintln!("  ensure sport_mode is OFF (go2_motion_ctrl release {iface}) and the area is clear ...");
@@ -478,14 +564,14 @@ fn run_hardware(
     let mut cmd = init_lowcmd();
     let loop_start = Instant::now();
     let mut tick: u64 = 0;
-    let mut emit = |q: &[f64; 12], kp: f32, kd: f32| -> Result<(), String> {
+    let mut emit = |q: &[f64; 12], tau: &[f64; 12], kp: f32, kd: f32| -> Result<(), String> {
         for j in 0..joint::NUM_LEG_JOINTS {
             let m = &mut cmd.motor_cmd[j];
             m.q = q[j] as f32;
             m.dq = 0.0;
             m.kp = kp;
             m.kd = kd;
-            m.tau = 0.0;
+            m.tau = tau[j] as f32;
         }
         set_crc(&mut cmd);
         writer.write(&cmd).map_err(|e| format!("write: {e}"))?;
@@ -499,6 +585,21 @@ fn run_hardware(
 
     let ticks = |secs: f64| -> u64 { (secs / CONTROL_DT).round().max(1.0) as u64 };
 
+    // Per gait tick: advance the controller, map to Go2 order, and (if enabled)
+    // compute the body-weight support feedforward from the stance set.
+    macro_rules! gait_step {
+        ($kp:expr, $kd:expr) => {{
+            let out = ctrl.tick(CONTROL_DT);
+            let q = output_to_go2(&out, &signs)?;
+            let tau = if ff {
+                support_tau_go2(&out, ctrl.kinematics(), &signs, weight)
+            } else {
+                ZERO_TAU
+            };
+            emit(&q, &tau, $kp, $kd)?;
+        }};
+    }
+
     // ── Phase A: ramp start → stance, kp 0 → kp ────────────────────────────
     eprintln!("phase A: ramp to stance ({RAMP_SECS}s)");
     let ramp_n = ticks(RAMP_SECS);
@@ -508,15 +609,14 @@ fn run_hardware(
         for j in 0..12 {
             q[j] = (1.0 - p) * start[j] + p * stance[j];
         }
-        emit(&q, (kp as f64 * p) as f32, kd)?;
+        emit(&q, &ZERO_TAU, (kp as f64 * p) as f32, kd)?;
     }
 
     // ── Phase B: in-place (vx=0) ───────────────────────────────────────────
     eprintln!("phase B: in-place vx=0 ({inplace_secs}s)");
     ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
     for _ in 0..ticks(inplace_secs) {
-        let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
-        emit(&q, kp, kd)?;
+        gait_step!(kp, kd);
     }
 
     // ── Phase C: forward crawl (accelerate, hold, decelerate) ──────────────
@@ -526,25 +626,21 @@ fn run_hardware(
         for i in 0..accel_n {
             let v = vx_target * (i as f64 / accel_n as f64);
             ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
-            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
-            emit(&q, kp, kd)?;
+            gait_step!(kp, kd);
         }
         ctrl.set_velocity_cmd(VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 });
         for _ in 0..ticks(forward_secs) {
-            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
-            emit(&q, kp, kd)?;
+            gait_step!(kp, kd);
         }
         for i in 0..accel_n {
             let v = vx_target * (1.0 - i as f64 / accel_n as f64);
             ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
-            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
-            emit(&q, kp, kd)?;
+            gait_step!(kp, kd);
         }
         // settle in place briefly
         ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
         for _ in 0..ticks(0.5) {
-            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
-            emit(&q, kp, kd)?;
+            gait_step!(kp, kd);
         }
     }
 
@@ -558,10 +654,10 @@ fn run_hardware(
         for j in 0..12 {
             q[j] = (1.0 - p) * cur[j] + p * LIE_POS[j];
         }
-        emit(&q, kp, kd)?;
+        emit(&q, &ZERO_TAU, kp, kd)?;
     }
     for _ in 0..ticks(0.5) {
-        emit(&LIE_POS, kp, kd)?;
+        emit(&LIE_POS, &ZERO_TAU, kp, kd)?;
     }
 
     eprintln!("done: gait complete, folded on the ground.");
@@ -582,15 +678,17 @@ fn run_diag(
     kp: f32,
     kd: f32,
     tune: GaitTune,
+    ff: bool,
 ) -> Result<(), String> {
     let swing_h = tune.swing_h;
-    let (mut ctrl, signs) = build_gait(misa_path, tune)?;
+    let (model, _home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
+    let weight = body_weight_n(&model);
     ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
     let stance = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
     ctrl.reset();
 
     eprintln!(
-        "diag: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?}",
+        "diag: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff}",
         tune.cycle_s, tune.four_support
     );
     eprintln!("  sport_mode must be OFF; area clear ...");
@@ -614,14 +712,14 @@ fn run_diag(
     let mut cmd = init_lowcmd();
     let loop_start = Instant::now();
     let mut tick: u64 = 0;
-    let mut emit = |q: &[f64; 12], kp: f32, kd: f32| -> Result<(), String> {
+    let mut emit = |q: &[f64; 12], tau: &[f64; 12], kp: f32, kd: f32| -> Result<(), String> {
         for j in 0..joint::NUM_LEG_JOINTS {
             let m = &mut cmd.motor_cmd[j];
             m.q = q[j] as f32;
             m.dq = 0.0;
             m.kp = kp;
             m.kd = kd;
-            m.tau = 0.0;
+            m.tau = tau[j] as f32;
         }
         set_crc(&mut cmd);
         writer.write(&cmd).map_err(|e| format!("write: {e}"))?;
@@ -650,7 +748,7 @@ fn run_diag(
         for j in 0..12 {
             q[j] = (1.0 - p) * start[j] + p * stance[j];
         }
-        emit(&q, (kp as f64 * p) as f32, kd)?;
+        emit(&q, &ZERO_TAU, (kp as f64 * p) as f32, kd)?;
     }
 
     eprintln!("phase,t_s,roll,pitch,FRt_cmd,FRt_act,FRc_cmd,FRc_act");
@@ -692,11 +790,25 @@ fn run_diag(
         Ok(())
     };
 
+    // Tick the gait, map to Go2 order, compute optional support FF.
+    macro_rules! gait_qtau {
+        () => {{
+            let out = ctrl.tick(CONTROL_DT);
+            let q = output_to_go2(&out, &signs)?;
+            let tau = if ff {
+                support_tau_go2(&out, ctrl.kinematics(), &signs, weight)
+            } else {
+                ZERO_TAU
+            };
+            (q, tau)
+        }};
+    }
+
     // Phase B: in-place (vx=0), recording.
     ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
     for i in 0..ticks(inplace_secs) {
-        let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
-        emit(&q, kp, kd)?;
+        let (q, tau) = gait_qtau!();
+        emit(&q, &tau, kp, kd)?;
         record(&reader, &q, "B", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log)?;
     }
 
@@ -706,21 +818,21 @@ fn run_diag(
         for i in 0..accel_n {
             let v = vx_target * (i as f64 / accel_n as f64);
             ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
-            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
-            emit(&q, kp, kd)?;
+            let (q, tau) = gait_qtau!();
+            emit(&q, &tau, kp, kd)?;
             record(&reader, &q, "C", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log)?;
         }
         ctrl.set_velocity_cmd(VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 });
         for i in 0..ticks(forward_secs) {
-            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
-            emit(&q, kp, kd)?;
+            let (q, tau) = gait_qtau!();
+            emit(&q, &tau, kp, kd)?;
             record(&reader, &q, "C", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log)?;
         }
         for i in 0..accel_n {
             let v = vx_target * (1.0 - i as f64 / accel_n as f64);
             ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
-            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
-            emit(&q, kp, kd)?;
+            let (q, tau) = gait_qtau!();
+            emit(&q, &tau, kp, kd)?;
         }
     }
 
@@ -733,10 +845,10 @@ fn run_diag(
         for j in 0..12 {
             q[j] = (1.0 - p) * cur[j] + p * LIE_POS[j];
         }
-        emit(&q, kp, kd)?;
+        emit(&q, &ZERO_TAU, kp, kd)?;
     }
     for _ in 0..ticks(0.5) {
-        emit(&LIE_POS, kp, kd)?;
+        emit(&LIE_POS, &ZERO_TAU, kp, kd)?;
     }
 
     // Summary.
