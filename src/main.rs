@@ -287,29 +287,83 @@ fn leg_base_motor(leg: LegId) -> usize {
     }
 }
 
-/// Static body-weight support feedforward (Nm per Go2 motor). Distribute the
-/// total weight equally among the current stance feet as a vertical ground
-/// reaction `f = (0,0,Fz)` (body frame), convert to joint torques via the
-/// support relation `τ = −Jᵀ·f` (IK convention), then into the motor/model
-/// sign convention. Swing legs get zero. Clamped for safety.
+/// Static body-weight support feedforward (Nm per Go2 motor).
+///
+/// Distribute the total weight among the current stance feet as vertical
+/// ground reactions `fᵢ = (0,0,fzᵢ)` (body frame) that balance both the weight
+/// and the moment about the CoM, then convert each to joint torques via the
+/// support relation `τ = −Jᵀ·f` (IK convention) and into the motor/model sign
+/// convention. Swing legs get zero. Clamped for safety.
+///
+/// The vertical foot forces are the least-norm solution of the quasi-static
+/// balance (with foot positions `(xᵢ,yᵢ)` and CoM `(cx,cy)` in the body frame):
+/// ```text
+///   Σ fzᵢ = W,   Σ fzᵢ·xᵢ = W·cx,   Σ fzᵢ·yᵢ = W·cy
+/// ```
+/// Writing `fzᵢ = λ₀ + λ₁·xᵢ + λ₂·yᵢ` (a plane over the support polygon), the
+/// three constraints become `(AAᵀ)·λ = b` with `A` the `3×n` matrix of rows
+/// `[1, xᵢ, yᵢ]`. This puts more load on the feet nearer the CoM, fixing the
+/// equal-split's rear-hip under-support when the CoM is off-centre. Degenerate
+/// geometry (collinear feet, `n<3`) falls back to an equal split.
 fn support_tau_go2(
     out: &ControllerOutput,
     kin: &quadruped_gait::KinematicsConfig,
     signs: &[[f64; 3]; 4],
     weight_n: f64,
+    com_xy: (f64, f64),
 ) -> [f64; 12] {
-    let n_stance = out.legs.iter().filter(|l| l.phase.is_stance).count().max(1);
-    let fz = weight_n / n_stance as f64;
-    let f = nalgebra::Vector3::new(0.0, 0.0, fz);
+    // Stance feet with body-frame foot position and joint angles.
+    let stance: Vec<(LegId, f64, f64, f64, f64, f64)> = out
+        .legs
+        .iter()
+        .filter(|l| l.phase.is_stance)
+        .map(|l| {
+            let p = quadruped_gait::forward_leg_kinematics(
+                kin.leg(l.leg),
+                l.q_hip,
+                l.q_thigh,
+                l.q_calf,
+            );
+            (l.leg, p.x, p.y, l.q_hip, l.q_thigh, l.q_calf)
+        })
+        .collect();
+    let n = stance.len();
     let mut tau = ZERO_TAU;
-    for l in out.legs.iter() {
-        if !l.phase.is_stance {
-            continue;
+    if n == 0 {
+        return tau;
+    }
+
+    // CoM-balanced vertical foot forces (least-norm), falling back to an equal
+    // split on degenerate geometry.
+    let (cx, cy) = com_xy;
+    let (mut s1, mut sx, mut sy, mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(_, x, y, ..) in &stance {
+        s1 += 1.0;
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        sxy += x * y;
+        syy += y * y;
+    }
+    let aat = nalgebra::Matrix3::new(s1, sx, sy, sx, sxx, sxy, sy, sxy, syy);
+    let b = nalgebra::Vector3::new(weight_n, weight_n * cx, weight_n * cy);
+    let fz: Vec<f64> = match aat.try_inverse() {
+        Some(inv) => {
+            let lam = inv * b;
+            stance
+                .iter()
+                .map(|&(_, x, y, ..)| (lam[0] + lam[1] * x + lam[2] * y).max(0.0))
+                .collect()
         }
-        let jac = quadruped_gait::foot_jacobian_body(kin.leg(l.leg), l.q_hip, l.q_thigh, l.q_calf);
+        None => vec![weight_n / n as f64; n],
+    };
+
+    for (i, &(leg, _, _, qh, qt, qc)) in stance.iter().enumerate() {
+        let f = nalgebra::Vector3::new(0.0, 0.0, fz[i]);
+        let jac = quadruped_gait::foot_jacobian_body(kin.leg(leg), qh, qt, qc);
         let tau_ik = -(jac.transpose() * f); // [hip, thigh, calf], IK convention
-        let slot = leg_slot(l.leg);
-        let base = leg_base_motor(l.leg);
+        let slot = leg_slot(leg);
+        let base = leg_base_motor(leg);
         for k in 0..3 {
             tau[base + k] = (tau_ik[k] * signs[slot][k]).clamp(-18.0, 18.0);
         }
@@ -321,16 +375,19 @@ fn support_tau_go2(
 /// displacement, the swing foot lift, and the stance foot fore/aft sweep.
 fn run_intent(misa_path: &str, vx: f64, tune: GaitTune) -> Result<(), String> {
     let swing_h = tune.swing_h;
-    let (model, _home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
+    let (model, home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
     let cycle = ctrl.config().cycle_period_s;
 
     // Report the body-weight support FF at the nominal stance (all 4 legs
     // down), so its sign and magnitude can be sanity-checked offline before
     // sending to hardware.
     let weight = body_weight_n(&model);
+    let com = misarta::centroidal::compute_com(&model, &home_q);
+    let com_xy = (com.x, com.y);
+    eprintln!("CoM (body frame): x={:.4} y={:.4} z={:.4} m", com.x, com.y, com.z);
     ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
     let out0 = ctrl.tick(CONTROL_DT);
-    let gtau = support_tau_go2(&out0, ctrl.kinematics(), &signs, weight);
+    let gtau = support_tau_go2(&out0, ctrl.kinematics(), &signs, weight, com_xy);
     eprintln!(
         "body weight = {weight:.1} N; stance support FF (Nm), Go2 order: FR[h,t,c]=[{:.2},{:.2},{:.2}] FL=[{:.2},{:.2},{:.2}] RR=[{:.2},{:.2},{:.2}] RL=[{:.2},{:.2},{:.2}]",
         gtau[0], gtau[1], gtau[2], gtau[3], gtau[4], gtau[5], gtau[6], gtau[7], gtau[8], gtau[9], gtau[10], gtau[11]
@@ -527,8 +584,10 @@ fn run_hardware(
     ff_scale: f64,
 ) -> Result<(), String> {
     let swing_h = tune.swing_h;
-    let (model, _home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
+    let (model, home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
     let weight = body_weight_n(&model) * ff_scale;
+    let com = misarta::centroidal::compute_com(&model, &home_q);
+    let com_xy = (com.x, com.y);
 
     // Nominal stance (Go2 order): the pose the gait holds at vx=0. Sample it
     // with one tick, then reset so the real loop starts from a clean phase.
@@ -537,8 +596,8 @@ fn run_hardware(
     ctrl.reset();
 
     eprintln!(
-        "go2-gait-runner: LinearCrawl  vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale}",
-        tune.cycle_s, tune.four_support
+        "go2-gait-runner: LinearCrawl  vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale} CoM=({:.3},{:.3})",
+        tune.cycle_s, tune.four_support, com.x, com.y
     );
     eprintln!("  ensure sport_mode is OFF (go2_motion_ctrl release {iface}) and the area is clear ...");
 
@@ -595,7 +654,7 @@ fn run_hardware(
             let out = ctrl.tick(CONTROL_DT);
             let q = output_to_go2(&out, &signs)?;
             let tau = if ff {
-                support_tau_go2(&out, ctrl.kinematics(), &signs, weight)
+                support_tau_go2(&out, ctrl.kinematics(), &signs, weight, com_xy)
             } else {
                 ZERO_TAU
             };
@@ -685,15 +744,17 @@ fn run_diag(
     ff_scale: f64,
 ) -> Result<(), String> {
     let swing_h = tune.swing_h;
-    let (model, _home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
+    let (model, home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
     let weight = body_weight_n(&model) * ff_scale;
+    let com = misarta::centroidal::compute_com(&model, &home_q);
+    let com_xy = (com.x, com.y);
     ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
     let stance = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
     ctrl.reset();
 
     eprintln!(
-        "diag: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale}",
-        tune.cycle_s, tune.four_support
+        "diag: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale} CoM=({:.3},{:.3})",
+        tune.cycle_s, tune.four_support, com.x, com.y
     );
     eprintln!("  sport_mode must be OFF; area clear ...");
 
@@ -800,7 +861,7 @@ fn run_diag(
             let out = ctrl.tick(CONTROL_DT);
             let q = output_to_go2(&out, &signs)?;
             let tau = if ff {
-                support_tau_go2(&out, ctrl.kinematics(), &signs, weight)
+                support_tau_go2(&out, ctrl.kinematics(), &signs, weight, com_xy)
             } else {
                 ZERO_TAU
             };
