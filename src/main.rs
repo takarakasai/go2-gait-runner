@@ -184,8 +184,50 @@ const ACCEL_SECS: f64 = 1.5;
 /// Seconds to ramp the final stance into the folded pose on exit.
 const FOLD_SECS: f64 = 2.0;
 
+/// Full usage for every mode and flag (`-h` / `--help`).
+fn print_help() {
+    eprint!(
+        "\
+go2-gait-runner — drive quadruped-gait LinearCrawl on a real Unitree Go2.
+
+USAGE:
+  go2-gait-runner <mode> [<iface>] [flags]
+
+MODES:
+  dump            Offline: assert the gait stays within Go2 joint limits.
+  intent          Offline: quantify forward displacement, foot sweep, lift.
+  run    <iface>  Hardware: ramp to stance -> in-place -> forward -> fold.
+  diag   <iface>  Hardware: same motion, log cmd-vs-measured + body tilt.
+
+FLAGS (all optional; <iface> is the 1st positional for run/diag):
+  --misa PATH       model .misa file        (default models/unitree_go2/go2.misa)
+  --vx V            forward speed, m/s       (run/diag default 0.0; intent 0.05)
+  --inplace S       in-place phase, seconds  (default 3)        [run/diag]
+  --forward S       forward phase, seconds   (default 4)        [run/diag]
+  --kp K            position gain            (default 60)        [run/diag]
+  --kd K            damping gain             (default 5)         [run/diag]
+  --swing H         foot lift height, m      (default 0.04)
+  --cycle S         gait cycle period, s     (default: crawl preset)
+  --four-support F  4-support fraction 0..1  (default: crawl preset)
+  --ff              enable body-weight support feedforward      [run/diag]
+  --ff-scale S      scale FF to real mass    (default 1.0)       [run/diag]
+  -h, --help        show this help
+
+EXAMPLE (validated on slippery flooring):
+  go2-gait-runner run eth0 --vx 0.02 --cycle 2.5 --four-support 0.9 \\
+      --swing 0.04 --kp 200 --kd 6 --ff --ff-scale 1.73
+"
+    );
+}
+
 fn main() {
     let cli = parse_cli(std::env::args().skip(1));
+    if cli.flags.contains_key("help")
+        || cli.positionals.iter().any(|p| p == "-h" || p == "--help")
+    {
+        print_help();
+        return;
+    }
     let mode = cli.positionals.first().map(|s| s.as_str()).unwrap_or("dump");
     let misa = cli
         .str("misa")
