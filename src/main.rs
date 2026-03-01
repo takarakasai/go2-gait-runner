@@ -77,6 +77,60 @@ fn parse_flag(s: &str) -> bool {
     matches!(s, "1" | "on" | "true" | "yes" | "ff" | "y")
 }
 
+/// Parsed command line: bare positionals plus `--key value` / `--key=value`
+/// named flags. Flags whose name is in [`BOOL_FLAGS`] never consume the next
+/// token (so `--ff --vx 0.02` works), and store `"true"` when present.
+struct Cli {
+    positionals: Vec<String>,
+    flags: std::collections::HashMap<String, String>,
+}
+
+/// Named flags that act as presence booleans (no value consumed).
+const BOOL_FLAGS: &[&str] = &["ff", "grav-ff"];
+
+fn parse_cli(args: impl Iterator<Item = String>) -> Cli {
+    let mut positionals = Vec::new();
+    let mut flags = std::collections::HashMap::new();
+    let mut it = args.peekable();
+    while let Some(a) = it.next() {
+        let Some(key) = a.strip_prefix("--") else {
+            positionals.push(a);
+            continue;
+        };
+        if let Some((k, v)) = key.split_once('=') {
+            flags.insert(k.to_string(), v.to_string());
+        } else if BOOL_FLAGS.contains(&key) {
+            flags.insert(key.to_string(), "true".to_string());
+        } else {
+            // Consume the next token as the value unless it is another flag.
+            match it.peek() {
+                Some(n) if !n.starts_with("--") => {
+                    flags.insert(key.to_string(), it.next().unwrap());
+                }
+                _ => {
+                    flags.insert(key.to_string(), "true".to_string());
+                }
+            }
+        }
+    }
+    Cli { positionals, flags }
+}
+
+impl Cli {
+    fn str(&self, key: &str) -> Option<&str> {
+        self.flags.get(key).map(|s| s.as_str())
+    }
+    fn f64(&self, key: &str) -> Option<f64> {
+        self.flags.get(key).and_then(|s| s.parse().ok())
+    }
+    fn f32(&self, key: &str) -> Option<f32> {
+        self.flags.get(key).and_then(|s| s.parse().ok())
+    }
+    fn flag(&self, key: &str) -> bool {
+        self.flags.get(key).map(|s| parse_flag(s)).unwrap_or(false)
+    }
+}
+
 /// 0 = hip, 1 = thigh, 2 = calf.
 fn joint_kind(name: &str) -> Option<usize> {
     if name.contains("hip") {
@@ -131,88 +185,63 @@ const ACCEL_SECS: f64 = 1.5;
 const FOLD_SECS: f64 = 2.0;
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let mode = args.next().unwrap_or_else(|| "dump".to_string());
-    let misa_path = args
-        .next()
-        .unwrap_or_else(|| "models/unitree_go2/go2.misa".to_string());
+    let cli = parse_cli(std::env::args().skip(1));
+    let mode = cli.positionals.first().map(|s| s.as_str()).unwrap_or("dump");
+    let misa = cli
+        .str("misa")
+        .unwrap_or("models/unitree_go2/go2.misa")
+        .to_string();
 
-    match mode.as_str() {
+    // Shared gait tuning flags (used by run/diag/intent).
+    let tune = GaitTune {
+        swing_h: cli.f64("swing").unwrap_or(0.04),
+        cycle_s: cli.f64("cycle"),
+        four_support: cli.f64("four-support"),
+    };
+
+    match mode {
         "dump" => {
-            // `dump [misa_path]`
-            if let Err(e) = run_dump(&misa_path) {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        }
-        "run" => {
-            // `run <iface> [misa_path] [vx] [inplace_secs] [forward_secs] [kp] [kd]`
-            // Here the 2nd arg is the iface, not the misa path.
-            let iface = misa_path; // 2nd positional
-            let mut rest = std::env::args().skip(3);
-            let misa = rest
-                .next()
-                .unwrap_or_else(|| "models/unitree_go2/go2.misa".to_string());
-            let vx: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let inplace_secs: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(3.0);
-            let forward_secs: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(4.0);
-            let kp: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(60.0);
-            let kd: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(5.0);
-            let swing_h: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(0.04);
-            let cycle_s: Option<f64> = rest.next().and_then(|s| s.parse().ok());
-            let four_support: Option<f64> = rest.next().and_then(|s| s.parse().ok());
-            let ff = rest.next().map(|s| parse_flag(&s)).unwrap_or(false);
-            let ff_scale: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
-            if iface.is_empty() || iface.ends_with(".misa") {
-                eprintln!("usage: go2-gait-runner run <iface> [misa] [vx] [inplace_s] [forward_s] [kp] [kd] [swing_h] [cycle_s] [four_support] [grav_ff] [ff_scale]");
-                std::process::exit(2);
-            }
-            let tune = GaitTune { swing_h, cycle_s, four_support };
-            if let Err(e) =
-                run_hardware(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, tune, ff, ff_scale)
-            {
+            // `dump [--misa P]`
+            if let Err(e) = run_dump(&misa) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
         }
         "intent" => {
-            // `intent [misa_path] [vx] [swing_h]` — offline: quantify the gait's
-            // intended forward displacement, foot sweep, and foot lift.
-            let vx: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0.05);
-            let swing_h: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0.04);
-            let cycle_s: Option<f64> = args.next().and_then(|s| s.parse().ok());
-            let four_support: Option<f64> = args.next().and_then(|s| s.parse().ok());
-            let tune = GaitTune { swing_h, cycle_s, four_support };
-            if let Err(e) = run_intent(&misa_path, vx, tune) {
+            // `intent [--misa P] [--vx V] [--swing H] [--cycle S] [--four-support F]`
+            // Offline: quantify the gait's forward displacement, foot sweep, lift.
+            let vx = cli.f64("vx").unwrap_or(0.05);
+            if let Err(e) = run_intent(&misa, vx, tune) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
         }
-        "diag" => {
-            // `diag <iface> [misa] [vx] [inplace_secs] [forward_secs] [kp] [kd] [swing_h]`
-            // Same motion as `run`, but logs commanded vs measured joint angles
-            // and body roll/pitch to size the kp/kd gains.
-            let iface = misa_path; // 2nd positional
-            let mut rest = std::env::args().skip(3);
-            let misa = rest
-                .next()
-                .unwrap_or_else(|| "models/unitree_go2/go2.misa".to_string());
-            let vx: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let inplace_secs: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(3.0);
-            let forward_secs: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(4.0);
-            let kp: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(60.0);
-            let kd: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(5.0);
-            let swing_h: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(0.04);
-            let cycle_s: Option<f64> = rest.next().and_then(|s| s.parse().ok());
-            let four_support: Option<f64> = rest.next().and_then(|s| s.parse().ok());
-            let ff = rest.next().map(|s| parse_flag(&s)).unwrap_or(false);
-            let ff_scale: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
-            if iface.is_empty() || iface.ends_with(".misa") {
-                eprintln!("usage: go2-gait-runner diag <iface> [misa] [vx] [inplace_s] [forward_s] [kp] [kd] [swing_h] [cycle_s] [four_support] [grav_ff] [ff_scale]");
+        "run" | "diag" => {
+            // `<run|diag> <iface> [--misa P] [--vx V] [--inplace S] [--forward S]
+            //   [--kp K] [--kd K] [--swing H] [--cycle S] [--four-support F]
+            //   [--ff] [--ff-scale S]`
+            let iface = cli.positionals.get(1).cloned().unwrap_or_default();
+            if iface.is_empty() {
+                eprintln!(
+                    "usage: go2-gait-runner {mode} <iface> [--misa P] [--vx V] \
+                     [--inplace S] [--forward S] [--kp K] [--kd K] [--swing H] \
+                     [--cycle S] [--four-support F] [--ff] [--ff-scale S]"
+                );
                 std::process::exit(2);
             }
-            let tune = GaitTune { swing_h, cycle_s, four_support };
-            if let Err(e) = run_diag(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, tune, ff, ff_scale) {
+            let vx = cli.f64("vx").unwrap_or(0.0);
+            let inplace = cli.f64("inplace").unwrap_or(3.0);
+            let forward = cli.f64("forward").unwrap_or(4.0);
+            let kp = cli.f32("kp").unwrap_or(60.0);
+            let kd = cli.f32("kd").unwrap_or(5.0);
+            let ff = cli.flag("ff") || cli.flag("grav-ff");
+            let ff_scale = cli.f64("ff-scale").unwrap_or(1.0);
+            let res = if mode == "run" {
+                run_hardware(&iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale)
+            } else {
+                run_diag(&iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale)
+            };
+            if let Err(e) = res {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
