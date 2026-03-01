@@ -9,4 +9,5 @@ description = "Headless runner: drive quadruped-gait on a real Unitree Go2 via u
 [dependencies]
 quadruped-gait = { path = "../quadruped-gait" }
 misarta = { path = "../misarta" }
+unitree-go2 = { path = "../../unitree-sdk-rs/crates/unitree-go2" }
 nalgebra = "0.34.2"

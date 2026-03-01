@@ -11,10 +11,15 @@
 //! ```
 //! The hardware send path (rt/lowcmd via unitree-sdk-rs) is added in a later step.
 
+use std::time::{Duration, Instant};
+
 use misarta::model::Model;
 use quadruped_gait::{
-    auto_detect_kinematics_config, joint_signs, AnyGaitController, GaitConfig, GaitGenerator,
-    GaitMode, KneePattern, VelocityCmd, DEFAULT_FOOT_LINKS,
+    auto_detect_kinematics_config, joint_signs, AnyGaitController, ControllerOutput, GaitConfig,
+    GaitGenerator, GaitMode, KneePattern, VelocityCmd, DEFAULT_FOOT_LINKS,
+};
+use unitree_go2::{
+    init_lowcmd, joint, set_crc, topics, LowState, Participant, ReaderQos, WriterQos,
 };
 
 /// Go2 standing-crouch joint angles (Menagerie `home` keyframe): the pose at
@@ -91,6 +96,35 @@ fn gait_slot(name: &str) -> Option<usize> {
     }
 }
 
+/// Convert a [`ControllerOutput`] to 12 Go2-ordered, sign-corrected joint
+/// angles (model/URDF convention, radians). Errors on an unmappable joint name.
+fn output_to_go2(out: &ControllerOutput, signs: &[[f64; 3]; 4]) -> Result<[f64; 12], String> {
+    let mut q = [0.0f64; 12];
+    for (name, q_ik) in out.iter_joint_targets() {
+        let slot = gait_slot(name).ok_or_else(|| format!("bad joint name {name}"))?;
+        let k = joint_kind(name).ok_or_else(|| format!("bad joint name {name}"))?;
+        let mi = go2_motor_index(name).ok_or_else(|| format!("no motor for {name}"))?;
+        q[mi] = q_ik * signs[slot][k];
+    }
+    Ok(q)
+}
+
+/// Folded lying pose in Go2 motor order (FR/FL/RR/RL × hip/thigh/calf), matching
+/// `go2_stand`'s `LIE_POS`. Used for a safe folded exit.
+const LIE_POS: [f64; 12] = [
+    0.0, 1.36, -2.65, // FR
+    0.0, 1.36, -2.65, // FL
+    -0.2, 1.36, -2.65, // RR
+    0.2, 1.36, -2.65, // RL
+];
+
+/// Seconds to ramp the start pose into the gait's nominal stance.
+const RAMP_SECS: f64 = 2.0;
+/// Seconds to ramp the forward velocity command up (and back down).
+const ACCEL_SECS: f64 = 1.5;
+/// Seconds to ramp the final stance into the folded pose on exit.
+const FOLD_SECS: f64 = 2.0;
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_else(|| "dump".to_string());
@@ -100,13 +134,36 @@ fn main() {
 
     match mode.as_str() {
         "dump" => {
+            // `dump [misa_path]`
             if let Err(e) = run_dump(&misa_path) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
         }
+        "run" => {
+            // `run <iface> [misa_path] [vx] [inplace_secs] [forward_secs] [kp] [kd]`
+            // Here the 2nd arg is the iface, not the misa path.
+            let iface = misa_path; // 2nd positional
+            let mut rest = std::env::args().skip(3);
+            let misa = rest
+                .next()
+                .unwrap_or_else(|| "models/unitree_go2/go2.misa".to_string());
+            let vx: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let inplace_secs: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(3.0);
+            let forward_secs: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(4.0);
+            let kp: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(60.0);
+            let kd: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(5.0);
+            if iface.is_empty() || iface.ends_with(".misa") {
+                eprintln!("usage: go2-gait-runner run <iface> [misa_path] [vx] [inplace_secs] [forward_secs] [kp] [kd]");
+                std::process::exit(2);
+            }
+            if let Err(e) = run_hardware(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         other => {
-            eprintln!("usage: go2-gait-runner dump [misa_path]   (got mode {other:?})");
+            eprintln!("usage: go2-gait-runner <dump|run> ...   (got mode {other:?})");
             std::process::exit(2);
         }
     }
@@ -198,5 +255,183 @@ fn run_dump(misa_path: &str) -> Result<(), String> {
         return Err(format!("{violations} joint-limit violations — not safe to send"));
     }
     eprintln!("OK: all commanded joint angles within Go2 limits.");
+    Ok(())
+}
+
+/// Block until a `LowState` arrives, returning the 12 leg-joint angles in Go2
+/// motor order (FR/FL/RR/RL × hip/thigh/calf).
+fn wait_for_start_pose(reader: &unitree_go2::Reader<LowState>) -> Result<[f64; 12], String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut warned = false;
+    loop {
+        if let Some(s) = reader.poll().map_err(|e| format!("poll: {e}"))? {
+            let mut q = [0.0f64; 12];
+            for j in 0..joint::NUM_LEG_JOINTS {
+                q[j] = s.motor_state[j].q as f64;
+            }
+            return Ok(q);
+        }
+        if Instant::now() >= deadline {
+            return Err("timeout waiting for LowState (check iface / 192.168.123.x / cabling)".into());
+        }
+        if !warned {
+            eprintln!("... waiting for LowState (check iface / 192.168.123.x / cabling)");
+            warned = true;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Drive the LinearCrawl gait on the real robot via rt/lowcmd at 500 Hz.
+///
+/// Phases (all low-level; sport_mode must already be OFF):
+///   A. ramp the captured start pose into the gait's nominal stance (kp 0→kp)
+///   B. hold in place (vx=0) for `inplace_secs`
+///   C. if `vx_target > 0`: accelerate to vx_target, hold `forward_secs`, decelerate
+///   D. fold to the lying pose for a safe exit
+#[allow(clippy::too_many_arguments)]
+fn run_hardware(
+    iface: &str,
+    misa_path: &str,
+    vx_target: f64,
+    inplace_secs: f64,
+    forward_secs: f64,
+    kp: f32,
+    kd: f32,
+) -> Result<(), String> {
+    // ── Build the gait (same pipeline as `dump`) ───────────────────────────
+    let parsed = misarta::native::load(misa_path).map_err(|e| format!("load {misa_path}: {e:?}"))?;
+    let (model, _vis, _col) =
+        misarta::native::build_model(&parsed.file).map_err(|e| format!("build_model: {e:?}"))?;
+    let home_q = build_home_q(&model);
+    let kin = auto_detect_kinematics_config(&model, &DEFAULT_FOOT_LINKS, &home_q)
+        .map_err(|errs| format!("kinematics auto-detect failed: {errs:?}"))?;
+    let signs = joint_signs(&model, &kin)?;
+    let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, GaitConfig::crawl(), kin);
+    ctrl.set_knee_pattern(KneePattern::BothBack);
+
+    // Nominal stance (Go2 order): the pose the gait holds at vx=0. Sample it
+    // with one tick, then reset so the real loop starts from a clean phase.
+    ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
+    let stance = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+    ctrl.reset();
+
+    eprintln!(
+        "go2-gait-runner: LinearCrawl  vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd}"
+    );
+    eprintln!("  ensure sport_mode is OFF (go2_motion_ctrl release {iface}) and the area is clear ...");
+
+    // ── DDS endpoints ──────────────────────────────────────────────────────
+    let dp = Participant::new(0, Some(iface)).map_err(|e| format!("participant: {e}"))?;
+    let cmd_topic = dp
+        .create_topic::<unitree_go2::LowCmd>(topics::LOW_CMD)
+        .map_err(|e| format!("cmd topic: {e}"))?;
+    let writer = dp
+        .create_writer(&cmd_topic, WriterQos::low_level_default())
+        .map_err(|e| format!("writer: {e}"))?;
+    let state_topic = dp
+        .create_topic::<LowState>(topics::LOW_STATE)
+        .map_err(|e| format!("state topic: {e}"))?;
+    let reader = dp
+        .create_reader(&state_topic, ReaderQos::low_level_default())
+        .map_err(|e| format!("reader: {e}"))?;
+
+    let start = wait_for_start_pose(&reader)?;
+    eprintln!(
+        "start pose captured: FR=[{:.3},{:.3},{:.3}] stance FR=[{:.3},{:.3},{:.3}]",
+        start[0], start[1], start[2], stance[0], stance[1], stance[2]
+    );
+
+    // ── 500 Hz emit closure (set 12 motors, CRC, write, pace to cadence) ───
+    let mut cmd = init_lowcmd();
+    let loop_start = Instant::now();
+    let mut tick: u64 = 0;
+    let mut emit = |q: &[f64; 12], kp: f32, kd: f32| -> Result<(), String> {
+        for j in 0..joint::NUM_LEG_JOINTS {
+            let m = &mut cmd.motor_cmd[j];
+            m.q = q[j] as f32;
+            m.dq = 0.0;
+            m.kp = kp;
+            m.kd = kd;
+            m.tau = 0.0;
+        }
+        set_crc(&mut cmd);
+        writer.write(&cmd).map_err(|e| format!("write: {e}"))?;
+        tick += 1;
+        let next = loop_start + Duration::from_secs_f64(CONTROL_DT * tick as f64);
+        if let Some(d) = next.checked_duration_since(Instant::now()) {
+            std::thread::sleep(d);
+        }
+        Ok(())
+    };
+
+    let ticks = |secs: f64| -> u64 { (secs / CONTROL_DT).round().max(1.0) as u64 };
+
+    // ── Phase A: ramp start → stance, kp 0 → kp ────────────────────────────
+    eprintln!("phase A: ramp to stance ({RAMP_SECS}s)");
+    let ramp_n = ticks(RAMP_SECS);
+    for i in 0..ramp_n {
+        let p = i as f64 / ramp_n as f64;
+        let mut q = [0.0f64; 12];
+        for j in 0..12 {
+            q[j] = (1.0 - p) * start[j] + p * stance[j];
+        }
+        emit(&q, (kp as f64 * p) as f32, kd)?;
+    }
+
+    // ── Phase B: in-place (vx=0) ───────────────────────────────────────────
+    eprintln!("phase B: in-place vx=0 ({inplace_secs}s)");
+    ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
+    for _ in 0..ticks(inplace_secs) {
+        let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+        emit(&q, kp, kd)?;
+    }
+
+    // ── Phase C: forward crawl (accelerate, hold, decelerate) ──────────────
+    if vx_target > 0.0 {
+        eprintln!("phase C: forward to vx={vx_target} (accel {ACCEL_SECS}s, hold {forward_secs}s, decel {ACCEL_SECS}s)");
+        let accel_n = ticks(ACCEL_SECS);
+        for i in 0..accel_n {
+            let v = vx_target * (i as f64 / accel_n as f64);
+            ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
+            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+            emit(&q, kp, kd)?;
+        }
+        ctrl.set_velocity_cmd(VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 });
+        for _ in 0..ticks(forward_secs) {
+            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+            emit(&q, kp, kd)?;
+        }
+        for i in 0..accel_n {
+            let v = vx_target * (1.0 - i as f64 / accel_n as f64);
+            ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
+            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+            emit(&q, kp, kd)?;
+        }
+        // settle in place briefly
+        ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
+        for _ in 0..ticks(0.5) {
+            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+            emit(&q, kp, kd)?;
+        }
+    }
+
+    // ── Phase D: fold to lying pose for a safe exit ────────────────────────
+    eprintln!("phase D: fold to lying pose ({FOLD_SECS}s)");
+    let cur = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+    let fold_n = ticks(FOLD_SECS);
+    for i in 0..fold_n {
+        let p = i as f64 / fold_n as f64;
+        let mut q = [0.0f64; 12];
+        for j in 0..12 {
+            q[j] = (1.0 - p) * cur[j] + p * LIE_POS[j];
+        }
+        emit(&q, kp, kd)?;
+    }
+    for _ in 0..ticks(0.5) {
+        emit(&LIE_POS, kp, kd)?;
+    }
+
+    eprintln!("done: gait complete, folded on the ground.");
     Ok(())
 }
