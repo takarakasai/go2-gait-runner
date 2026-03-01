@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use misarta::model::Model;
 use quadruped_gait::{
     auto_detect_kinematics_config, joint_signs, AnyGaitController, ControllerOutput, GaitConfig,
-    GaitGenerator, GaitMode, KneePattern, VelocityCmd, DEFAULT_FOOT_LINKS,
+    GaitGenerator, GaitMode, KneePattern, LegId, VelocityCmd, DEFAULT_FOOT_LINKS,
 };
 use unitree_go2::{
     init_lowcmd, joint, set_crc, topics, LowState, Participant, ReaderQos, WriterQos,
@@ -153,20 +153,139 @@ fn main() {
             let forward_secs: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(4.0);
             let kp: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(60.0);
             let kd: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(5.0);
+            let swing_h: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(0.04);
             if iface.is_empty() || iface.ends_with(".misa") {
-                eprintln!("usage: go2-gait-runner run <iface> [misa_path] [vx] [inplace_secs] [forward_secs] [kp] [kd]");
+                eprintln!("usage: go2-gait-runner run <iface> [misa_path] [vx] [inplace_secs] [forward_secs] [kp] [kd] [swing_h]");
                 std::process::exit(2);
             }
-            if let Err(e) = run_hardware(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd) {
+            if let Err(e) =
+                run_hardware(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, swing_h)
+            {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        "intent" => {
+            // `intent [misa_path] [vx] [swing_h]` — offline: quantify the gait's
+            // intended forward displacement, foot sweep, and foot lift.
+            let vx: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0.05);
+            let swing_h: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0.04);
+            if let Err(e) = run_intent(&misa_path, vx, swing_h) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        "diag" => {
+            // `diag <iface> [misa] [vx] [inplace_secs] [forward_secs] [kp] [kd] [swing_h]`
+            // Same motion as `run`, but logs commanded vs measured joint angles
+            // and body roll/pitch to size the kp/kd gains.
+            let iface = misa_path; // 2nd positional
+            let mut rest = std::env::args().skip(3);
+            let misa = rest
+                .next()
+                .unwrap_or_else(|| "models/unitree_go2/go2.misa".to_string());
+            let vx: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let inplace_secs: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(3.0);
+            let forward_secs: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(4.0);
+            let kp: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(60.0);
+            let kd: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(5.0);
+            let swing_h: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(0.04);
+            if iface.is_empty() || iface.ends_with(".misa") {
+                eprintln!("usage: go2-gait-runner diag <iface> [misa] [vx] [inplace_secs] [forward_secs] [kp] [kd] [swing_h]");
+                std::process::exit(2);
+            }
+            if let Err(e) =
+                run_diag(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, swing_h)
+            {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
         }
         other => {
-            eprintln!("usage: go2-gait-runner <dump|run> ...   (got mode {other:?})");
+            eprintln!("usage: go2-gait-runner <dump|intent|run|diag> ...   (got mode {other:?})");
             std::process::exit(2);
         }
     }
+}
+
+/// Build the LinearCrawl controller and sign table from a `.misa` file.
+fn build_gait(
+    misa_path: &str,
+    swing_h: f64,
+) -> Result<(AnyGaitController, [[f64; 3]; 4]), String> {
+    let parsed = misarta::native::load(misa_path).map_err(|e| format!("load {misa_path}: {e:?}"))?;
+    let (model, _vis, _col) =
+        misarta::native::build_model(&parsed.file).map_err(|e| format!("build_model: {e:?}"))?;
+    let home_q = build_home_q(&model);
+    let kin = auto_detect_kinematics_config(&model, &DEFAULT_FOOT_LINKS, &home_q)
+        .map_err(|errs| format!("kinematics auto-detect failed: {errs:?}"))?;
+    let signs = joint_signs(&model, &kin)?;
+    let cfg = GaitConfig::crawl().with_swing_height(swing_h);
+    let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
+    ctrl.set_knee_pattern(KneePattern::BothBack);
+    Ok((ctrl, signs))
+}
+
+/// Offline: quantify what the gait *intends* — per-cycle forward trunk
+/// displacement, the swing foot lift, and the stance foot fore/aft sweep.
+fn run_intent(misa_path: &str, vx: f64, swing_h: f64) -> Result<(), String> {
+    let (mut ctrl, _signs) = build_gait(misa_path, swing_h)?;
+    let cycle = ctrl.config().cycle_period_s;
+    let n = ((2.5 * cycle) / CONTROL_DT).round() as usize; // ~2.5 cycles
+    ctrl.set_velocity_cmd(VelocityCmd { vx, vy: 0.0, wz: 0.0 });
+
+    eprintln!(
+        "intent: vx={vx} swing_h={swing_h} cycle={cycle:.3}s — expecting ~{:.3} m/cycle forward",
+        vx * cycle
+    );
+    eprintln!("t_s,body_x,FR_footx,FR_footz,FR_phase,FL_footz,RR_footz,RL_footz");
+
+    let mut x0 = None;
+    let (mut fr_x_min, mut fr_x_max, mut fr_z_max) = (f64::MAX, f64::MIN, f64::MIN);
+    let mut last_x = 0.0;
+    for step in 0..n {
+        let out = ctrl.tick(CONTROL_DT);
+        let bx = out.body_state.world_position.x;
+        if x0.is_none() {
+            x0 = Some(bx);
+        }
+        last_x = bx;
+        let fr = out.leg(LegId::FR);
+        fr_x_min = fr_x_min.min(fr.foot_body.x);
+        fr_x_max = fr_x_max.max(fr.foot_body.x);
+        // lift = how far the foot rises above its nominal stance z.
+        let lift = fr.foot_body.z - ctrl.kinematics().fr.nominal_foot_body.z;
+        fr_z_max = fr_z_max.max(lift);
+        if step % 50 == 0 {
+            let t = step as f64 * CONTROL_DT;
+            eprintln!(
+                "{t:.3},{bx:.4},{:.4},{:+.4},{:?},{:+.4},{:+.4},{:+.4}",
+                fr.foot_body.x,
+                lift,
+                fr.phase,
+                out.leg(LegId::FL).foot_body.z - ctrl.kinematics().fl.nominal_foot_body.z,
+                out.leg(LegId::RR).foot_body.z - ctrl.kinematics().rr.nominal_foot_body.z,
+                out.leg(LegId::RL).foot_body.z - ctrl.kinematics().rl.nominal_foot_body.z,
+            );
+        }
+    }
+    let net = last_x - x0.unwrap_or(0.0);
+    eprintln!(
+        "\nsummary: net body_x advance over {:.2}s = {net:.4} m ({:.4} m/cycle)",
+        n as f64 * CONTROL_DT,
+        net / (n as f64 * CONTROL_DT / cycle)
+    );
+    eprintln!(
+        "  FR foot fore/aft sweep = {:.4} m (x {:.4}..{:.4}), peak swing lift = {:.4} m (cmd swing_h={swing_h})",
+        fr_x_max - fr_x_min,
+        fr_x_min,
+        fr_x_max,
+        fr_z_max
+    );
+    if net.abs() < 1e-4 {
+        eprintln!("  WARNING: body_x does not advance — forward intent is ~0 in the open-loop trunk.");
+    }
+    Ok(())
 }
 
 fn run_dump(misa_path: &str) -> Result<(), String> {
@@ -298,6 +417,7 @@ fn run_hardware(
     forward_secs: f64,
     kp: f32,
     kd: f32,
+    swing_h: f64,
 ) -> Result<(), String> {
     // ── Build the gait (same pipeline as `dump`) ───────────────────────────
     let parsed = misarta::native::load(misa_path).map_err(|e| format!("load {misa_path}: {e:?}"))?;
@@ -307,7 +427,10 @@ fn run_hardware(
     let kin = auto_detect_kinematics_config(&model, &DEFAULT_FOOT_LINKS, &home_q)
         .map_err(|errs| format!("kinematics auto-detect failed: {errs:?}"))?;
     let signs = joint_signs(&model, &kin)?;
-    let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, GaitConfig::crawl(), kin);
+    // crawl() defaults to a 5 mm swing (tuned for minimal trunk pitch); raise
+    // it so the swing feet actually clear the ground.
+    let cfg = GaitConfig::crawl().with_swing_height(swing_h);
+    let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
     ctrl.set_knee_pattern(KneePattern::BothBack);
 
     // Nominal stance (Go2 order): the pose the gait holds at vx=0. Sample it
@@ -317,7 +440,7 @@ fn run_hardware(
     ctrl.reset();
 
     eprintln!(
-        "go2-gait-runner: LinearCrawl  vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd}"
+        "go2-gait-runner: LinearCrawl  vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h}"
     );
     eprintln!("  ensure sport_mode is OFF (go2_motion_ctrl release {iface}) and the area is clear ...");
 
@@ -433,5 +556,194 @@ fn run_hardware(
     }
 
     eprintln!("done: gait complete, folded on the ground.");
+    Ok(())
+}
+
+/// Hardware diagnostic: run the same stance→in-place→forward→fold motion, but
+/// each tick read the measured joint angles and body roll/pitch back from
+/// `rt/lowstate` and report per-joint tracking error and body tilt. Use this to
+/// size kp/kd: large stance tracking error ⇒ the legs sag under load (raise kp).
+#[allow(clippy::too_many_arguments)]
+fn run_diag(
+    iface: &str,
+    misa_path: &str,
+    vx_target: f64,
+    inplace_secs: f64,
+    forward_secs: f64,
+    kp: f32,
+    kd: f32,
+    swing_h: f64,
+) -> Result<(), String> {
+    let (mut ctrl, signs) = build_gait(misa_path, swing_h)?;
+    ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
+    let stance = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+    ctrl.reset();
+
+    eprintln!(
+        "diag: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h}"
+    );
+    eprintln!("  sport_mode must be OFF; area clear ...");
+
+    let dp = Participant::new(0, Some(iface)).map_err(|e| format!("participant: {e}"))?;
+    let cmd_topic = dp
+        .create_topic::<unitree_go2::LowCmd>(topics::LOW_CMD)
+        .map_err(|e| format!("cmd topic: {e}"))?;
+    let writer = dp
+        .create_writer(&cmd_topic, WriterQos::low_level_default())
+        .map_err(|e| format!("writer: {e}"))?;
+    let state_topic = dp
+        .create_topic::<LowState>(topics::LOW_STATE)
+        .map_err(|e| format!("state topic: {e}"))?;
+    let reader = dp
+        .create_reader(&state_topic, ReaderQos::low_level_default())
+        .map_err(|e| format!("reader: {e}"))?;
+
+    let start = wait_for_start_pose(&reader)?;
+
+    let mut cmd = init_lowcmd();
+    let loop_start = Instant::now();
+    let mut tick: u64 = 0;
+    let mut emit = |q: &[f64; 12], kp: f32, kd: f32| -> Result<(), String> {
+        for j in 0..joint::NUM_LEG_JOINTS {
+            let m = &mut cmd.motor_cmd[j];
+            m.q = q[j] as f32;
+            m.dq = 0.0;
+            m.kp = kp;
+            m.kd = kd;
+            m.tau = 0.0;
+        }
+        set_crc(&mut cmd);
+        writer.write(&cmd).map_err(|e| format!("write: {e}"))?;
+        tick += 1;
+        let next = loop_start + Duration::from_secs_f64(CONTROL_DT * tick as f64);
+        if let Some(d) = next.checked_duration_since(Instant::now()) {
+            std::thread::sleep(d);
+        }
+        Ok(())
+    };
+    let ticks = |secs: f64| -> u64 { (secs / CONTROL_DT).round().max(1.0) as u64 };
+
+    // Accumulators over the recorded (B + C) phases.
+    let mut err_sum = [0.0f64; 12];
+    let mut err_max = [0.0f64; 12];
+    let mut n_rec = 0u64;
+    let mut roll_max = 0.0f64;
+    let mut pitch_max = 0.0f64;
+    let mut sample_log = 0u64;
+
+    // Phase A: ramp to stance.
+    let ramp_n = ticks(RAMP_SECS);
+    for i in 0..ramp_n {
+        let p = i as f64 / ramp_n as f64;
+        let mut q = [0.0f64; 12];
+        for j in 0..12 {
+            q[j] = (1.0 - p) * start[j] + p * stance[j];
+        }
+        emit(&q, (kp as f64 * p) as f32, kd)?;
+    }
+
+    eprintln!("phase,t_s,roll,pitch,FRt_cmd,FRt_act,FRc_cmd,FRc_act");
+
+    // Recording closure body, used in B and C.
+    let record = |reader: &unitree_go2::Reader<LowState>,
+                      q_cmd: &[f64; 12],
+                      phase: &str,
+                      t: f64,
+                      err_sum: &mut [f64; 12],
+                      err_max: &mut [f64; 12],
+                      n_rec: &mut u64,
+                      roll_max: &mut f64,
+                      pitch_max: &mut f64,
+                      sample_log: &mut u64|
+     -> Result<(), String> {
+        if let Some(s) = reader.poll().map_err(|e| format!("poll: {e}"))? {
+            for j in 0..joint::NUM_LEG_JOINTS {
+                let e = (q_cmd[j] - s.motor_state[j].q as f64).abs();
+                err_sum[j] += e;
+                err_max[j] = err_max[j].max(e);
+            }
+            *n_rec += 1;
+            let roll = s.imu_state.rpy[0] as f64;
+            let pitch = s.imu_state.rpy[1] as f64;
+            *roll_max = roll_max.max(roll.abs());
+            *pitch_max = pitch_max.max(pitch.abs());
+            if *sample_log % 25 == 0 {
+                eprintln!(
+                    "{phase},{t:.3},{roll:+.3},{pitch:+.3},{:.3},{:.3},{:.3},{:.3}",
+                    q_cmd[1],
+                    s.motor_state[1].q,
+                    q_cmd[2],
+                    s.motor_state[2].q
+                );
+            }
+            *sample_log += 1;
+        }
+        Ok(())
+    };
+
+    // Phase B: in-place (vx=0), recording.
+    ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
+    for i in 0..ticks(inplace_secs) {
+        let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+        emit(&q, kp, kd)?;
+        record(&reader, &q, "B", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log)?;
+    }
+
+    // Phase C: forward, recording.
+    if vx_target > 0.0 {
+        let accel_n = ticks(ACCEL_SECS);
+        for i in 0..accel_n {
+            let v = vx_target * (i as f64 / accel_n as f64);
+            ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
+            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+            emit(&q, kp, kd)?;
+            record(&reader, &q, "C", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log)?;
+        }
+        ctrl.set_velocity_cmd(VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 });
+        for i in 0..ticks(forward_secs) {
+            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+            emit(&q, kp, kd)?;
+            record(&reader, &q, "C", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log)?;
+        }
+        for i in 0..accel_n {
+            let v = vx_target * (1.0 - i as f64 / accel_n as f64);
+            ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
+            let q = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+            emit(&q, kp, kd)?;
+        }
+    }
+
+    // Phase D: fold to lying pose.
+    let cur = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+    let fold_n = ticks(FOLD_SECS);
+    for i in 0..fold_n {
+        let p = i as f64 / fold_n as f64;
+        let mut q = [0.0f64; 12];
+        for j in 0..12 {
+            q[j] = (1.0 - p) * cur[j] + p * LIE_POS[j];
+        }
+        emit(&q, kp, kd)?;
+    }
+    for _ in 0..ticks(0.5) {
+        emit(&LIE_POS, kp, kd)?;
+    }
+
+    // Summary.
+    let names = [
+        "FR_hip", "FR_thigh", "FR_calf", "FL_hip", "FL_thigh", "FL_calf", "RR_hip", "RR_thigh",
+        "RR_calf", "RL_hip", "RL_thigh", "RL_calf",
+    ];
+    eprintln!("\n=== diag summary over {n_rec} samples (B+C) ===");
+    eprintln!("  per-joint tracking error |cmd-act| (rad): mean / max");
+    for j in 0..12 {
+        let mean = if n_rec > 0 { err_sum[j] / n_rec as f64 } else { 0.0 };
+        eprintln!("    {:<8} mean={mean:.4}  max={:.4}", names[j], err_max[j]);
+    }
+    eprintln!(
+        "  body tilt: max|roll|={roll_max:.3} rad ({:.1} deg)  max|pitch|={pitch_max:.3} rad ({:.1} deg)",
+        roll_max.to_degrees(),
+        pitch_max.to_degrees()
+    );
+    eprintln!("done: diag complete, folded on the ground.");
     Ok(())
 }
