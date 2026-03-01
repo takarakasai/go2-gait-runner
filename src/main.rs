@@ -162,13 +162,14 @@ fn main() {
             let cycle_s: Option<f64> = rest.next().and_then(|s| s.parse().ok());
             let four_support: Option<f64> = rest.next().and_then(|s| s.parse().ok());
             let ff = rest.next().map(|s| parse_flag(&s)).unwrap_or(false);
+            let ff_scale: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
             if iface.is_empty() || iface.ends_with(".misa") {
-                eprintln!("usage: go2-gait-runner run <iface> [misa] [vx] [inplace_s] [forward_s] [kp] [kd] [swing_h] [cycle_s] [four_support] [grav_ff]");
+                eprintln!("usage: go2-gait-runner run <iface> [misa] [vx] [inplace_s] [forward_s] [kp] [kd] [swing_h] [cycle_s] [four_support] [grav_ff] [ff_scale]");
                 std::process::exit(2);
             }
             let tune = GaitTune { swing_h, cycle_s, four_support };
             if let Err(e) =
-                run_hardware(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, tune, ff)
+                run_hardware(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, tune, ff, ff_scale)
             {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -205,12 +206,13 @@ fn main() {
             let cycle_s: Option<f64> = rest.next().and_then(|s| s.parse().ok());
             let four_support: Option<f64> = rest.next().and_then(|s| s.parse().ok());
             let ff = rest.next().map(|s| parse_flag(&s)).unwrap_or(false);
+            let ff_scale: f64 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
             if iface.is_empty() || iface.ends_with(".misa") {
-                eprintln!("usage: go2-gait-runner diag <iface> [misa] [vx] [inplace_s] [forward_s] [kp] [kd] [swing_h] [cycle_s] [four_support] [grav_ff]");
+                eprintln!("usage: go2-gait-runner diag <iface> [misa] [vx] [inplace_s] [forward_s] [kp] [kd] [swing_h] [cycle_s] [four_support] [grav_ff] [ff_scale]");
                 std::process::exit(2);
             }
             let tune = GaitTune { swing_h, cycle_s, four_support };
-            if let Err(e) = run_diag(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, tune, ff) {
+            if let Err(e) = run_diag(&iface, &misa, vx, inplace_secs, forward_secs, kp, kd, tune, ff, ff_scale) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -522,10 +524,11 @@ fn run_hardware(
     kd: f32,
     tune: GaitTune,
     ff: bool,
+    ff_scale: f64,
 ) -> Result<(), String> {
     let swing_h = tune.swing_h;
     let (model, _home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
-    let weight = body_weight_n(&model);
+    let weight = body_weight_n(&model) * ff_scale;
 
     // Nominal stance (Go2 order): the pose the gait holds at vx=0. Sample it
     // with one tick, then reset so the real loop starts from a clean phase.
@@ -534,7 +537,7 @@ fn run_hardware(
     ctrl.reset();
 
     eprintln!(
-        "go2-gait-runner: LinearCrawl  vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff}",
+        "go2-gait-runner: LinearCrawl  vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale}",
         tune.cycle_s, tune.four_support
     );
     eprintln!("  ensure sport_mode is OFF (go2_motion_ctrl release {iface}) and the area is clear ...");
@@ -679,16 +682,17 @@ fn run_diag(
     kd: f32,
     tune: GaitTune,
     ff: bool,
+    ff_scale: f64,
 ) -> Result<(), String> {
     let swing_h = tune.swing_h;
     let (model, _home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
-    let weight = body_weight_n(&model);
+    let weight = body_weight_n(&model) * ff_scale;
     ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
     let stance = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
     ctrl.reset();
 
     eprintln!(
-        "diag: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff}",
+        "diag: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale}",
         tune.cycle_s, tune.four_support
     );
     eprintln!("  sport_mode must be OFF; area clear ...");
