@@ -86,7 +86,7 @@ struct Cli {
 }
 
 /// Named flags that act as presence booleans (no value consumed).
-const BOOL_FLAGS: &[&str] = &["ff", "grav-ff"];
+const BOOL_FLAGS: &[&str] = &["ff", "grav-ff", "no-release", "restore"];
 
 fn parse_cli(args: impl Iterator<Item = String>) -> Cli {
     let mut positionals = Vec::new();
@@ -196,9 +196,12 @@ USAGE:
 MODES:
   dump            Offline: assert the gait stays within Go2 joint limits.
   intent          Offline: quantify forward displacement, foot sweep, lift.
-  run    <iface>  Hardware: ramp -> in-place -> forward -> fold; reads state
-                  back and prints a tracking-error + body-tilt summary.
+  run    <iface>  Hardware: release sport_mode -> ramp -> in-place -> forward
+                  -> fold; reads state back and prints a tracking/tilt summary.
   diag   <iface>  Alias for `run` (identical behaviour).
+  release <iface> Deactivate sport_mode (native RPC; replaces go2_motion_ctrl).
+  restore <iface> Re-select \"normal\" so the onboard controller takes over.
+  checkmode <iface>  Print the currently active motion mode.
 
 FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --misa PATH       model .misa file        (default models/unitree_go2/go2.misa)
@@ -214,6 +217,8 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --ff              enable body-weight support feedforward      [run/diag]
   --ff-scale S      scale FF to real mass    (default 1.0)       [run/diag]
   --csv PATH        write full per-tick telemetry CSV           [run/diag]
+  --no-release      do NOT auto-release sport_mode at startup   [run/diag]
+  --restore         re-activate sport_mode after the run        [run/diag]
   -h, --help        show this help
 
 EXAMPLE (validated on slippery flooring):
@@ -283,6 +288,21 @@ fn main() {
             let ff = cli.flag("ff") || cli.flag("grav-ff");
             let ff_scale = cli.f64("ff-scale").unwrap_or(1.0);
             let csv = cli.str("csv");
+
+            // Deactivate sport_mode before low-level control unless told not to.
+            // Without this the onboard controller fights rt/lowcmd and the joints
+            // oscillate. The RpcClient is created and dropped here, before the
+            // gait participant comes up.
+            if !cli.flag("no-release") {
+                if let Err(e) = motion_release(&iface) {
+                    eprintln!(
+                        "error: failed to release sport_mode: {e}\n\
+                         (pass --no-release if you released it some other way)"
+                    );
+                    std::process::exit(1);
+                }
+            }
+
             // `run` and `diag` are the same path now; both always read state back
             // and print the tracking/tilt summary. `diag` is kept as an alias.
             let res = run_hardware(
@@ -292,12 +312,79 @@ fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
+
+            // The gait ends folded on the ground, so by default we leave
+            // sport_mode off (safe). `--restore` hands control back afterwards.
+            if cli.flag("restore") {
+                if let Err(e) = motion_restore(&iface) {
+                    eprintln!("warning: failed to restore sport_mode: {e}");
+                }
+            }
+        }
+        "release" => {
+            let iface = require_iface(&cli);
+            if let Err(e) = motion_release(&iface) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        "restore" => {
+            let iface = require_iface(&cli);
+            if let Err(e) = motion_restore(&iface) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        "checkmode" => {
+            let iface = require_iface(&cli);
+            match unitree_rpc::MotionSwitcher::new(&iface).and_then(|sw| sw.check_mode()) {
+                Ok((form, name)) => {
+                    if name.is_empty() {
+                        println!("no mode active (sport_mode released)");
+                    } else {
+                        println!("active mode: name={name:?} form={form:?}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         other => {
-            eprintln!("usage: go2-gait-runner <dump|intent|run|diag> ...   (got mode {other:?})");
+            eprintln!(
+                "usage: go2-gait-runner <dump|intent|run|diag|release|restore|checkmode> ...   \
+                 (got mode {other:?})"
+            );
             std::process::exit(2);
         }
     }
+}
+
+/// First positional after the mode, or exit with a usage error.
+fn require_iface(cli: &Cli) -> String {
+    let iface = cli.positionals.get(1).cloned().unwrap_or_default();
+    if iface.is_empty() {
+        eprintln!("usage: go2-gait-runner {} <iface>", cli.positionals.first().map(|s| s.as_str()).unwrap_or("release"));
+        std::process::exit(2);
+    }
+    iface
+}
+
+/// Deactivate the onboard sport_mode controller via the motion_switcher RPC.
+fn motion_release(iface: &str) -> Result<(), String> {
+    let sw = unitree_rpc::MotionSwitcher::new(iface).map_err(|e| e.to_string())?;
+    let n = sw.release().map_err(|e| e.to_string())?;
+    eprintln!("sport_mode released ({n} mode(s) released); low-level control is now safe");
+    Ok(())
+}
+
+/// Hand control back to the onboard sport_mode controller (selects "normal").
+fn motion_restore(iface: &str) -> Result<(), String> {
+    let sw = unitree_rpc::MotionSwitcher::new(iface).map_err(|e| e.to_string())?;
+    sw.restore().map_err(|e| e.to_string())?;
+    eprintln!("sport_mode restored (onboard controller will take a standing pose)");
+    Ok(())
 }
 
 /// Gait tuning knobs shared by run/diag/intent. `None` keeps the crawl preset.
@@ -698,7 +785,7 @@ fn run_hardware(
         "go2-gait-runner: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale} CoM=({:.3},{:.3})",
         tune.cycle_s, tune.four_support, com.x, com.y
     );
-    eprintln!("  ensure sport_mode is OFF (go2_motion_ctrl release {iface}) and the area is clear ...");
+    eprintln!("  sport_mode released via native RPC (unless --no-release); ensure the area is clear ...");
 
     let dp = Participant::new(0, Some(iface)).map_err(|e| format!("participant: {e}"))?;
     let cmd_topic = dp

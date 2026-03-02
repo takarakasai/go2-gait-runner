@@ -10,4 +10,5 @@ description = "Headless runner: drive quadruped-gait on a real Unitree Go2 via u
 quadruped-gait = { path = "../quadruped-gait" }
 misarta = { path = "../misarta" }
 unitree-go2 = { path = "../../unitree-sdk-rs/crates/unitree-go2" }
+unitree-rpc = { path = "../../unitree-sdk-rs/crates/unitree-rpc" }
 nalgebra = "0.34.2"
