@@ -86,7 +86,7 @@ struct Cli {
 }
 
 /// Named flags that act as presence booleans (no value consumed).
-const BOOL_FLAGS: &[&str] = &["ff", "grav-ff", "no-release", "restore"];
+const BOOL_FLAGS: &[&str] = &["ff", "grav-ff", "no-release", "restore", "smooth-swing", "level"];
 
 fn parse_cli(args: impl Iterator<Item = String>) -> Cli {
     let mut positionals = Vec::new();
@@ -214,8 +214,11 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --cycle S         gait cycle period, s     (default: crawl preset)
   --four-support F  4-support fraction 0..1  (default: crawl preset)
   --sway M          lateral body-sway amplitude, m (default 0 = off)
+  --smooth-swing    C2 swing profile: zero accel at lift-off/touchdown (gentler)
+  --level           active IMU body-leveling: trim stance feet to hold trunk flat
+  --level-gain G    leveling strength, signed (default 0.3; negate if it worsens)
   --ff              enable body-weight support feedforward      [run/diag]
-  --ff-scale S      scale FF to real mass    (default 1.0)       [run/diag]
+  --ff-scale S      fraction of body weight to support, 1.0=full (default 1.0) [run/diag]
   --csv PATH        write full per-tick telemetry CSV           [run/diag]
   --no-release      do NOT auto-release sport_mode at startup   [run/diag]
   --restore         re-activate sport_mode after the run        [run/diag]
@@ -223,7 +226,7 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
 
 EXAMPLE (validated on slippery flooring):
   go2-gait-runner run eth0 --vx 0.02 --cycle 2.5 --four-support 0.9 \\
-      --swing 0.04 --kp 200 --kd 6 --ff --ff-scale 1.73
+      --swing 0.04 --kp 200 --kd 6 --ff
 "
     );
 }
@@ -248,6 +251,7 @@ fn main() {
         cycle_s: cli.f64("cycle"),
         four_support: cli.f64("four-support"),
         sway: cli.f64("sway"),
+        smooth_swing: cli.flag("smooth-swing"),
     };
 
     match mode {
@@ -287,6 +291,13 @@ fn main() {
             let kd = cli.f32("kd").unwrap_or(5.0);
             let ff = cli.flag("ff") || cli.flag("grav-ff");
             let ff_scale = cli.f64("ff-scale").unwrap_or(1.0);
+            // Active IMU body-leveling: off unless --level. --level-gain sets the
+            // (signed) strength; negate it if leveling makes the tilt worse.
+            let level_gain = if cli.flag("level") {
+                cli.f64("level-gain").unwrap_or(0.3)
+            } else {
+                0.0
+            };
             let csv = cli.str("csv");
 
             // Deactivate sport_mode before low-level control unless told not to.
@@ -306,7 +317,7 @@ fn main() {
             // `run` and `diag` are the same path now; both always read state back
             // and print the tracking/tilt summary. `diag` is kept as an alias.
             let res = run_hardware(
-                &iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale, csv,
+                &iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale, level_gain, csv,
             );
             if let Err(e) = res {
                 eprintln!("error: {e}");
@@ -395,6 +406,8 @@ struct GaitTune {
     four_support: Option<f64>,
     /// Lateral body-sway amplitude (m). `None`/0 keeps the no-sway crawl.
     sway: Option<f64>,
+    /// Use the C² (zero accel at lift-off/touchdown) vertical swing profile.
+    smooth_swing: bool,
 }
 
 /// Zero feedforward torque.
@@ -423,6 +436,7 @@ fn build_gait(
     if let Some(s) = tune.sway {
         cfg = cfg.with_lateral_sway(s);
     }
+    cfg = cfg.with_smooth_swing(tune.smooth_swing);
     let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
     ctrl.set_knee_pattern(KneePattern::BothBack);
     Ok((model, home_q, ctrl, signs))
@@ -434,8 +448,16 @@ fn build_gait(
 /// a distributed ground reaction (below).
 fn body_weight_n(model: &Model<f64>) -> f64 {
     let m: f64 = model.inertias.iter().map(|i| i.mass).sum();
-    m * 9.81
+    m * 9.81 * REAL_WEIGHT_FACTOR
 }
+
+/// Empirically-calibrated ratio of the **real** Go2's supported weight to the
+/// summed link weight of the misarta model. The fixed-base model
+/// under-represents the trunk mass, so support FF computed from the raw model
+/// weight under-supports the real robot by this factor (validated on hardware).
+/// Folding it into [`body_weight_n`] makes `--ff-scale` a true fraction of real
+/// body weight: `1.0` = full support, which is the default.
+const REAL_WEIGHT_FACTOR: f64 = 1.73;
 
 fn leg_slot(leg: LegId) -> usize {
     match leg {
@@ -537,6 +559,64 @@ fn support_tau_go2(
         }
     }
     tau
+}
+
+/// Max per-leg foot-height trim the leveler may command (m), and the max joint
+/// delta per joint (rad). Hard clamps so a wrong sign / large gain can only ever
+/// nudge the posture, never command a big motion on hardware.
+const LEVEL_MAX_DZ: f64 = 0.02;
+const LEVEL_MAX_DQ: f64 = 0.08;
+
+/// Active body-leveling correction (joint-angle deltas per Go2 motor).
+///
+/// Reads the measured trunk `roll` / `pitch` (rad, from the IMU) and trims each
+/// **stance** leg's foot height to drive them toward zero — the closed-loop
+/// counterpart to the open-loop gait. A foot at body-frame `(x, y)` gets a
+/// vertical trim
+///
+/// ```text
+///   dz = gain · (roll · y − pitch · x)
+/// ```
+///
+/// (more-negative `dz` extends the planted leg, pushing that corner of the
+/// trunk up). The trim is mapped to joint deltas through the inverse foot
+/// Jacobian `dq = J⁻¹·[0,0,dz]`, then into Go2 motor order with the IK→motor
+/// sign table — mirroring [`support_tau_go2`]. Swing legs are skipped (they
+/// must follow their trajectory). Everything is clamped by [`LEVEL_MAX_DZ`] /
+/// [`LEVEL_MAX_DQ`].
+///
+/// `gain` is signed: if leveling *increases* tilt on the robot (the IMU sign
+/// convention is opposite), negate it. Start small (≈0.3) and raise until the
+/// 3-leg-phase roll/pitch stops shrinking.
+fn level_correction(
+    out: &ControllerOutput,
+    kin: &quadruped_gait::KinematicsConfig,
+    signs: &[[f64; 3]; 4],
+    roll: f64,
+    pitch: f64,
+    gain: f64,
+) -> [f64; 12] {
+    let mut dq = [0.0f64; 12];
+    for l in out.legs.iter().filter(|l| l.phase.is_stance) {
+        let p = quadruped_gait::forward_leg_kinematics(
+            kin.leg(l.leg),
+            l.q_hip,
+            l.q_thigh,
+            l.q_calf,
+        );
+        let dz = (gain * (roll * p.y - pitch * p.x)).clamp(-LEVEL_MAX_DZ, LEVEL_MAX_DZ);
+        let jac = quadruped_gait::foot_jacobian_body(kin.leg(l.leg), l.q_hip, l.q_thigh, l.q_calf);
+        let Some(inv) = jac.try_inverse() else {
+            continue; // singular (rare); skip this leg's trim this tick
+        };
+        let dq_ik = inv * nalgebra::Vector3::new(0.0, 0.0, dz);
+        let slot = leg_slot(l.leg);
+        let base = leg_base_motor(l.leg);
+        for k in 0..3 {
+            dq[base + k] = (dq_ik[k] * signs[slot][k]).clamp(-LEVEL_MAX_DQ, LEVEL_MAX_DQ);
+        }
+    }
+    dq
 }
 
 /// Offline: quantify what the gait *intends* — per-cycle forward trunk
@@ -769,6 +849,7 @@ fn run_hardware(
     tune: GaitTune,
     ff: bool,
     ff_scale: f64,
+    level_gain: f64,
     csv_path: Option<&str>,
 ) -> Result<(), String> {
     use std::io::Write as _;
@@ -782,8 +863,8 @@ fn run_hardware(
     ctrl.reset();
 
     eprintln!(
-        "go2-gait-runner: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale} CoM=({:.3},{:.3})",
-        tune.cycle_s, tune.four_support, com.x, com.y
+        "go2-gait-runner: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale} smooth_swing={} level_gain={level_gain} CoM=({:.3},{:.3})",
+        tune.cycle_s, tune.four_support, tune.smooth_swing, com.x, com.y
     );
     eprintln!("  sport_mode released via native RPC (unless --no-release); ensure the area is clear ...");
 
@@ -832,6 +913,12 @@ fn run_hardware(
     let mut n_rec = 0u64;
     let mut roll_max = 0.0f64;
     let mut pitch_max = 0.0f64;
+    // Yaw drift = straightness ("x方向のみ"). Track deviation from the first
+    // recorded heading and the net (final) drift, so a tuning pass can be scored
+    // on how little the robot turns off the +x axis.
+    let mut yaw_first: Option<f64> = None;
+    let mut yaw_dev_max = 0.0f64;
+    let mut yaw_last = 0.0f64;
     let mut sample_log = 0u64;
 
     // Go2 motor order; reused for the CSV columns and the summary table.
@@ -875,8 +962,10 @@ fn run_hardware(
 
     eprintln!("phase,t_s,roll,pitch,FRt_cmd,FRt_act,FRc_cmd,FRc_act");
 
-    // Recording closure body, used in B and C.
-    let record = |reader: &unitree_go2::Reader<LowState>,
+    // Recording closure body, used in B and C. Takes a pre-polled `LowState`
+    // (the loop polls once per tick and shares the sample with the leveling
+    // feedback) so the reader isn't drained twice per tick.
+    let record = |sample: Option<&LowState>,
                       q_cmd: &[f64; 12],
                       phase: &str,
                       t: f64,
@@ -885,10 +974,13 @@ fn run_hardware(
                       n_rec: &mut u64,
                       roll_max: &mut f64,
                       pitch_max: &mut f64,
+                      yaw_first: &mut Option<f64>,
+                      yaw_dev_max: &mut f64,
+                      yaw_last: &mut f64,
                       sample_log: &mut u64,
                       csv: &mut Option<std::io::BufWriter<std::fs::File>>|
      -> Result<(), String> {
-        if let Some(s) = reader.poll().map_err(|e| format!("poll: {e}"))? {
+        if let Some(s) = sample {
             for j in 0..joint::NUM_LEG_JOINTS {
                 let e = (q_cmd[j] - s.motor_state[j].q as f64).abs();
                 err_sum[j] += e;
@@ -897,8 +989,21 @@ fn run_hardware(
             *n_rec += 1;
             let roll = s.imu_state.rpy[0] as f64;
             let pitch = s.imu_state.rpy[1] as f64;
+            let yaw = s.imu_state.rpy[2] as f64;
             *roll_max = roll_max.max(roll.abs());
             *pitch_max = pitch_max.max(pitch.abs());
+            // Heading drift relative to the first recorded sample. Unwrap the
+            // ±π wrap so a small drift near the ±π seam isn't read as ~2π.
+            let ref_yaw = *yaw_first.get_or_insert(yaw);
+            let mut dyaw = yaw - ref_yaw;
+            while dyaw > std::f64::consts::PI {
+                dyaw -= 2.0 * std::f64::consts::PI;
+            }
+            while dyaw < -std::f64::consts::PI {
+                dyaw += 2.0 * std::f64::consts::PI;
+            }
+            *yaw_dev_max = yaw_dev_max.max(dyaw.abs());
+            *yaw_last = dyaw;
             if *sample_log % 25 == 0 {
                 eprintln!(
                     "{phase},{t:.3},{roll:+.3},{pitch:+.3},{:.3},{:.3},{:.3},{:.3}",
@@ -939,16 +1044,32 @@ fn run_hardware(
         Ok(())
     };
 
-    // Tick the gait, map to Go2 order, compute optional support FF.
+    // Latest measured body attitude (roll, pitch, yaw). Updated once per tick
+    // from the shared LowState poll and read by the leveling correction below.
+    // Declared before the macros so they capture it (macro_rules hygiene
+    // resolves outer identifiers at the definition site).
+    let mut last_rpy = [0.0f64; 3];
+
+    // Tick the gait, map to Go2 order, compute optional support FF, and apply
+    // the optional IMU body-leveling correction (drives measured roll/pitch
+    // toward zero by trimming the stance feet — see `level_correction`).
     macro_rules! gait_qtau {
         () => {{
             let out = ctrl.tick(CONTROL_DT);
-            let q = output_to_go2(&out, &signs)?;
+            let mut q = output_to_go2(&out, &signs)?;
             let tau = if ff {
                 support_tau_go2(&out, ctrl.kinematics(), &signs, weight, com_xy)
             } else {
                 ZERO_TAU
             };
+            if level_gain != 0.0 {
+                let dq = level_correction(
+                    &out, ctrl.kinematics(), &signs, last_rpy[0], last_rpy[1], level_gain,
+                );
+                for j in 0..12 {
+                    q[j] += dq[j];
+                }
+            }
             (q, tau)
         }};
     }
@@ -958,12 +1079,29 @@ fn run_hardware(
     let b_dur = ticks(inplace_secs) as f64 * CONTROL_DT;
     let accel_dur = ticks(ACCEL_SECS) as f64 * CONTROL_DT;
 
+    // Poll the reader once and refresh `last_rpy`; returns the sample so the
+    // same read also feeds `record` (avoids draining the reader twice/tick).
+    macro_rules! poll_state {
+        () => {{
+            let s = reader.poll().map_err(|e| format!("poll: {e}"))?;
+            if let Some(st) = &s {
+                last_rpy = [
+                    st.imu_state.rpy[0] as f64,
+                    st.imu_state.rpy[1] as f64,
+                    st.imu_state.rpy[2] as f64,
+                ];
+            }
+            s
+        }};
+    }
+
     // Phase B: in-place (vx=0), recording.
     ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
     for i in 0..ticks(inplace_secs) {
+        let sample = poll_state!();
         let (q, tau) = gait_qtau!();
         emit(&q, &tau, kp, kd)?;
-        record(&reader, &q, "B", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log, &mut csv)?;
+        record(sample.as_ref(), &q, "B", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
     }
 
     // Phase C: forward, recording.
@@ -972,19 +1110,22 @@ fn run_hardware(
         for i in 0..accel_n {
             let v = vx_target * (i as f64 / accel_n as f64);
             ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
+            let sample = poll_state!();
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
-            record(&reader, &q, "C", b_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log, &mut csv)?;
+            record(sample.as_ref(), &q, "C", b_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
         }
         ctrl.set_velocity_cmd(VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 });
         for i in 0..ticks(forward_secs) {
+            let sample = poll_state!();
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
-            record(&reader, &q, "C", b_dur + accel_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut sample_log, &mut csv)?;
+            record(sample.as_ref(), &q, "C", b_dur + accel_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
         }
         for i in 0..accel_n {
             let v = vx_target * (1.0 - i as f64 / accel_n as f64);
             ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
+            let _sample = poll_state!();
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
         }
@@ -1017,6 +1158,13 @@ fn run_hardware(
         roll_max.to_degrees(),
         pitch_max.to_degrees()
     );
+    eprintln!(
+        "  heading (straightness): max|yaw drift|={yaw_dev_max:.3} rad ({:.1} deg)  \
+         net drift={yaw_last:+.3} rad ({:+.1} deg)",
+        yaw_dev_max.to_degrees(),
+        yaw_last.to_degrees()
+    );
+    eprintln!("  → minimise roll/pitch (sway) and |yaw drift| (off-axis) when tuning.");
     eprintln!("done: gait complete, folded on the ground.");
     Ok(())
 }
