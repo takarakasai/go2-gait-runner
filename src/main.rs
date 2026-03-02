@@ -214,6 +214,7 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --cycle S         gait cycle period, s     (default: crawl preset)
   --four-support F  4-support fraction 0..1  (default: crawl preset)
   --sway M          lateral body-sway amplitude, m (default 0 = off)
+  --stance-width M  widen the stance outward, m: bigger support, no trunk motion
   --smooth-swing    C2 swing profile: zero accel at lift-off/touchdown (gentler)
   --level           active IMU body-leveling: trim stance feet to hold trunk flat
   --level-gain G    leveling strength, signed (default 0.3; negate if it worsens)
@@ -252,6 +253,7 @@ fn main() {
         four_support: cli.f64("four-support"),
         sway: cli.f64("sway"),
         smooth_swing: cli.flag("smooth-swing"),
+        stance_width: cli.f64("stance-width"),
     };
 
     match mode {
@@ -408,6 +410,8 @@ struct GaitTune {
     sway: Option<f64>,
     /// Use the C² (zero accel at lift-off/touchdown) vertical swing profile.
     smooth_swing: bool,
+    /// Lateral stance widening (m). `None` keeps the detected stance.
+    stance_width: Option<f64>,
 }
 
 /// Zero feedforward torque.
@@ -437,6 +441,9 @@ fn build_gait(
         cfg = cfg.with_lateral_sway(s);
     }
     cfg = cfg.with_smooth_swing(tune.smooth_swing);
+    if let Some(w) = tune.stance_width {
+        cfg = cfg.with_stance_width(w);
+    }
     let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
     ctrl.set_knee_pattern(KneePattern::BothBack);
     Ok((model, home_q, ctrl, signs))
@@ -663,8 +670,11 @@ fn run_intent(misa_path: &str, vx: f64, tune: GaitTune) -> Result<(), String> {
         last_x = bx;
         let fr = out.leg(LegId::FR);
         // The trunk shift equals (nominal − commanded) foot-body Y; with no
-        // sway it stays 0. Positive = trunk moved to body-left (+Y).
-        let by = ctrl.kinematics().fr.nominal_foot_body.y - fr.foot_body.y;
+        // sway it stays 0. Positive = trunk moved to body-left (+Y). Account for
+        // stance widening (FR is on the right, so it shifts the planted foot by
+        // −width) so the readout is true sway, not the static widen offset.
+        let fr_widen = -tune.stance_width.unwrap_or(0.0);
+        let by = (ctrl.kinematics().fr.nominal_foot_body.y + fr_widen) - fr.foot_body.y;
         sway_min = sway_min.min(by);
         sway_max = sway_max.max(by);
         fr_x_min = fr_x_min.min(fr.foot_body.x);
