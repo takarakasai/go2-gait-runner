@@ -211,6 +211,7 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --kp K            position gain            (default 60)        [run/diag]
   --kd K            damping gain             (default 5)         [run/diag]
   --swing H         foot lift height, m      (default 0.04)
+  --stance-height M trunk height above the feet, m (default 0.35)
   --cycle S         gait cycle period, s     (default: crawl preset)
   --four-support F  4-support fraction 0..1  (default: crawl preset)
   --sway M          lateral body-sway amplitude, m (default 0 = off)
@@ -258,12 +259,13 @@ fn main() {
         smooth_swing: cli.flag("smooth-swing"),
         stance_width: cli.f64("stance-width"),
         max_swing_foot_speed: cli.f64("max-swing-speed"),
+        stance_height: cli.f64("stance-height").unwrap_or(0.35),
     };
 
     match mode {
         "dump" => {
-            // `dump [--misa P]`
-            if let Err(e) = run_dump(&misa) {
+            // `dump [--misa P] [--stance-height M]`
+            if let Err(e) = run_dump(&misa, tune.stance_height) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -421,6 +423,10 @@ struct GaitTune {
     /// actuators can track (which shakes the body). `None` keeps the crawl
     /// preset default (3.0); `Some(0.0)` disables the guard.
     max_swing_foot_speed: Option<f64>,
+    /// Trunk stance height (m): the height the body is held above the feet
+    /// during the gait (LinearCrawl). Overrides the auto-detected nominal
+    /// foot height. Default 0.35 m.
+    stance_height: f64,
 }
 
 /// Zero feedforward torque.
@@ -460,6 +466,9 @@ fn build_gait(
     }
     let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
     ctrl.set_knee_pattern(KneePattern::BothBack);
+    // Hold the trunk at the requested stance height (overrides the
+    // auto-detected nominal foot height). LinearCrawl only.
+    ctrl.set_body_height_m(tune.stance_height);
     Ok((model, home_q, ctrl, signs))
 }
 
@@ -734,7 +743,7 @@ fn run_intent(misa_path: &str, vx: f64, tune: GaitTune) -> Result<(), String> {
     Ok(())
 }
 
-fn run_dump(misa_path: &str) -> Result<(), String> {
+fn run_dump(misa_path: &str, stance_height: f64) -> Result<(), String> {
     // 1. Load the Go2 model straight from .misa (no articara).
     let parsed = misarta::native::load(misa_path).map_err(|e| format!("load {misa_path}: {e:?}"))?;
     let (model, _vis, _col) =
@@ -774,6 +783,8 @@ fn run_dump(misa_path: &str) -> Result<(), String> {
     let cfg = GaitConfig::crawl();
     let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
     ctrl.set_knee_pattern(KneePattern::BothBack);
+    // Check joint limits at the same stance height the gait will run at.
+    ctrl.set_body_height_m(stance_height);
 
     // 4. Run two phases: in-place (vx=0) then a slow forward crawl, and check
     //    every commanded angle (after sign correction) against the Go2 limits.
@@ -887,8 +898,8 @@ fn run_hardware(
     ctrl.reset();
 
     eprintln!(
-        "go2-gait-runner: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} max_swing_speed={:?} grav_ff={ff} ff_scale={ff_scale} smooth_swing={} level_gain={level_gain} CoM=({:.3},{:.3})",
-        tune.cycle_s, tune.four_support, tune.max_swing_foot_speed, tune.smooth_swing, com.x, com.y
+        "go2-gait-runner: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} stance_height={:.3} cycle={:?} four_support={:?} max_swing_speed={:?} grav_ff={ff} ff_scale={ff_scale} smooth_swing={} level_gain={level_gain} CoM=({:.3},{:.3})",
+        tune.stance_height, tune.cycle_s, tune.four_support, tune.max_swing_foot_speed, tune.smooth_swing, com.x, com.y
     );
     eprintln!("  sport_mode released via native RPC (unless --no-release); ensure the area is clear ...");
 
