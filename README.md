@@ -33,13 +33,19 @@ ssh -T git@github.com-takarakasai      # should greet you as takarakasai
 ```sh
 git clone ssh://git@github.com-takarakasai/takarakasai/go2-gait-runner.git
 cd go2-gait-runner
+# Point cyclonedds-sys at a CycloneDDS install for your arch (the FFI
+# bindings are committed for x86_64 + aarch64; only the .so is resolved
+# here). The Unitree SDK2's bundled thirdparty libs work:
+export UNITREE_SDK2_ROOT=/path/to/unitree_sdk2     # has thirdparty/{include,lib/<arch>}
+#   or:  export CYCLONEDDS_HOME=/path/to/cyclonedds-install
 cargo build --release            # fetches articara + unitree-sdk-rs from GitHub
 ```
 
-`unitree-sdk-rs`'s `cyclonedds-sys` needs CycloneDDS + generated FFI
-bindings. On a fresh x86_64 host without committed bindings, build with
-`--features buildtime-bindgen` (needs `libclang`) or run
-`unitree-sdk-rs/tools/regen-bindings.sh`. See that repo for DDS setup.
+`cyclonedds-sys` does not vendor `libddsc.so`, so the build resolves it from
+`UNITREE_SDK2_ROOT/thirdparty/lib/<arch>` (or `CYCLONEDDS_HOME/lib/<arch>`).
+The FFI bindings themselves are committed for x86_64 and aarch64; a new arch
+needs `unitree-sdk-rs/tools/regen-bindings.sh` (bindgen + libclang). At run
+time also set `LD_LIBRARY_PATH` to the same lib dir (see `doc/manual.md`).
 
 ### Local co-development against uncommitted articara changes
 

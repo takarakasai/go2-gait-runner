@@ -45,19 +45,24 @@ articara の歩容生成（`quadruped-gait`）で確認した歩容を、articar
 
 ```bash
 cd go2-gait-runner
-cargo build            # デバッグ
+# cyclonedds-sys が libddsc.so を解決できるよう、arch 別の CycloneDDS を指す。
+# Unitree SDK2 同梱の thirdparty が使える（x86_64 / aarch64 両方同梱）:
+export UNITREE_SDK2_ROOT=/path/to/unitree_sdk2     # thirdparty/{include,lib/<arch>}
+#   または: export CYCLONEDDS_HOME=/path/to/cyclonedds-install
+cargo build            # デバッグ（articara・unitree-sdk-rs を GitHub から取得）
 # cargo build --release  # 実機運用は release 推奨
 ```
 
-- このリポジトリは `articara`・`unitree-sdk-rs` を **sibling path 依存**で参照する。
-  3つを同じ親ディレクトリに並べて clone しておくこと（`README.md` 参照）。
-- `quadruped-gait` のビルドには `misarta`（`articara/misarta` submodule）が必要。
-  `git -C ../articara submodule update --init --recursive` で取得。
-- `unitree-go2` は `cyclonedds-sys` 経由で libddsc をリンクする。`cargo run` は
-  `LD_LIBRARY_PATH=/home/takara/cyclonedds-install/lib` を自動設定する。**ビルド済みバイナリを
-  直接実行する場合は手動で設定**すること:
+- 依存（`quadruped-gait`/`misarta`/`unitree-go2`/`unitree-rpc`）は **GitHub から git 依存**で
+  自動取得される（sibling clone 不要、`README.md` 参照）。
+- `cyclonedds-sys` は `libddsc.so` を vendor していないため、ビルド時に
+  `UNITREE_SDK2_ROOT/thirdparty/lib/<arch>`（または `CYCLONEDDS_HOME/lib/<arch>`）から解決する。
+  FFI バインディングは x86_64 / aarch64 とも commit 済み（新 arch のみ
+  `unitree-sdk-rs/tools/regen-bindings.sh` で生成、libclang 必須）。
+- 実行時も同じ lib ディレクトリを `LD_LIBRARY_PATH` に設定する。`cargo run` は自動設定するが、
+  **ビルド済みバイナリを直接実行する場合は手動で設定**すること:
   ```bash
-  export LD_LIBRARY_PATH=/home/takara/cyclonedds-install/lib
+  export LD_LIBRARY_PATH=$UNITREE_SDK2_ROOT/thirdparty/lib/x86_64   # arch に合わせる
   ```
   設定し忘れると次のエラーで起動に失敗する:
   ```text
