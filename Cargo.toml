@@ -1,3 +1,11 @@
+# Standalone repository for the Go2 hardware runner. It consumes the
+# shared gait library (`quadruped-gait`) and model format (`misarta`) from
+# the `articara` repo, and the Unitree SDK from `unitree-sdk-rs`, all via
+# sibling path dependencies. Expected checkout layout:
+#
+#   <parent>/articara/          (quadruped-gait, misarta live here)
+#   <parent>/unitree-sdk-rs/    (unitree-go2, unitree-rpc crates)
+#   <parent>/go2-gait-runner/   (this repo)
 [package]
 name = "go2-gait-runner"
 version = "0.1.0"
@@ -7,8 +15,12 @@ publish = false
 description = "Headless runner: drive quadruped-gait on a real Unitree Go2 via unitree-sdk-rs."
 
 [dependencies]
-quadruped-gait = { path = "../quadruped-gait" }
-misarta = { path = "../misarta" }
-unitree-go2 = { path = "../../unitree-sdk-rs/crates/unitree-go2" }
-unitree-rpc = { path = "../../unitree-sdk-rs/crates/unitree-rpc" }
+quadruped-gait = { path = "../articara/quadruped-gait" }
+misarta = { path = "../articara/misarta" }
+unitree-go2 = { path = "../unitree-sdk-rs/crates/unitree-go2" }
+unitree-rpc = { path = "../unitree-sdk-rs/crates/unitree-rpc" }
 nalgebra = "0.34.2"
+
+# Own workspace root so cargo doesn't try to inherit a parent workspace
+# via the path dependencies above.
+[workspace]
