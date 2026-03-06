@@ -14,10 +14,10 @@ publish = false
 description = "Headless CLI to run articara/quadruped-gait controllers on a real Unitree Go2 — low-level rt/lowcmd at 500 Hz via unitree-sdk-rs."
 
 [dependencies]
-quadruped-gait = { git = "ssh://git@github.com-takarakasai/takarakasai/articara.git", package = "quadruped-gait" }
-misarta = { git = "ssh://git@github.com-takarakasai/takarakasai/articara.git", package = "misarta" }
-unitree-go2 = { git = "ssh://git@github.com-takarakasai/takarakasai/unitree-sdk-rs.git", package = "unitree-go2" }
-unitree-rpc = { git = "ssh://git@github.com-takarakasai/takarakasai/unitree-sdk-rs.git", package = "unitree-rpc" }
+quadruped-gait = { git = "ssh://git@github.com/takarakasai/articara.git", package = "quadruped-gait" }
+misarta = { git = "ssh://git@github.com/takarakasai/articara.git", package = "misarta" }
+unitree-go2 = { git = "ssh://git@github.com/takarakasai/unitree-sdk-rs.git", package = "unitree-go2" }
+unitree-rpc = { git = "ssh://git@github.com/takarakasai/unitree-sdk-rs.git", package = "unitree-rpc" }
 nalgebra = "0.34.2"
 
 # Own workspace root so cargo doesn't try to inherit a parent workspace.
