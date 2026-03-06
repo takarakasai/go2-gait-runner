@@ -1,0 +1,6 @@
+# Use the system git for fetching git dependencies so that custom SSH host
+# aliases in ~/.ssh/config (e.g. `github.com-takarakasai`) and submodule
+# fetches are honoured. libgit2 (cargo's default) does not read ssh config
+# host aliases.
+[net]
+git-fetch-with-cli = true

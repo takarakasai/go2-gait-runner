@@ -9,38 +9,49 @@ the `.misa` model format live in the `articara` repo; this repo only
 contains the hardware glue (motor ordering, sign tables, sport-mode
 release, body-weight feedforward, telemetry).
 
-## Checkout layout
+## Dependencies
 
-It depends on its siblings via path dependencies, so clone them next to
-each other under a common parent:
+Self-contained: cargo fetches the dependencies from GitHub — no sibling
+checkout needed.
 
-```
-<parent>/
-  articara/          # provides quadruped-gait, misarta
-  unitree-sdk-rs/    # provides unitree-go2, unitree-rpc, cyclonedds-sys
-  go2-gait-runner/   # this repo
-```
+- `quadruped-gait` + `misarta` from the `articara` repo (same git source,
+  so the `misarta` type shared with `quadruped-gait` unifies; `misarta` is
+  articara's submodule).
+- `unitree-go2` + `unitree-rpc` from `unitree-sdk-rs`.
+
+These are private repos fetched over SSH using the `github.com-takarakasai`
+host alias (see your `~/.ssh/config`). [`.cargo/config.toml`](.cargo/config.toml)
+sets `net.git-fetch-with-cli = true` so the system git resolves that alias
+and the misarta submodule (libgit2 cannot). Make sure SSH access works:
 
 ```sh
-cd <parent>
-git clone git@github.com-takarakasai:takarakasai/articara.git
-git clone git@github.com-takarakasai:takarakasai/unitree-sdk-rs.git
-git clone git@github.com-takarakasai:takarakasai/go2-gait-runner.git
-# articara pulls misarta as a submodule:
-git -C articara submodule update --init --recursive
+ssh -T git@github.com-takarakasai      # should greet you as takarakasai
 ```
 
 ## Build
 
 ```sh
+git clone ssh://git@github.com-takarakasai/takarakasai/go2-gait-runner.git
 cd go2-gait-runner
-cargo build --release
+cargo build --release            # fetches articara + unitree-sdk-rs from GitHub
 ```
 
 `unitree-sdk-rs`'s `cyclonedds-sys` needs CycloneDDS + generated FFI
 bindings. On a fresh x86_64 host without committed bindings, build with
 `--features buildtime-bindgen` (needs `libclang`) or run
 `unitree-sdk-rs/tools/regen-bindings.sh`. See that repo for DDS setup.
+
+### Local co-development against uncommitted articara changes
+
+The git dependencies track `articara`/`unitree-sdk-rs` **main**. To build
+against local, not-yet-pushed changes, add a path override in
+`.cargo/config.toml` (do not commit) — for example:
+
+```toml
+[patch."ssh://git@github.com-takarakasai/takarakasai/articara.git"]
+quadruped-gait = { path = "../articara/quadruped-gait" }
+misarta = { path = "../articara/misarta" }
+```
 
 ## Usage
 
