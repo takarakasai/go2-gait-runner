@@ -216,6 +216,9 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --sway M          lateral body-sway amplitude, m (default 0 = off)
   --stance-width M  widen the stance outward, m: bigger support, no trunk motion
   --smooth-swing    C2 swing profile: zero accel at lift-off/touchdown (gentler)
+  --max-swing-speed V  cap peak swing-foot speed, m/s: auto-slows forward speed
+                    so a high --four-support doesn't shake the body (default 3.0;
+                    0 = disable = legacy unbounded). Slowing --cycle does NOT help.
   --level           active IMU body-leveling: trim stance feet to hold trunk flat
   --level-gain G    leveling strength, signed (default 0.3; negate if it worsens)
   --ff              enable body-weight support feedforward      [run/diag]
@@ -254,6 +257,7 @@ fn main() {
         sway: cli.f64("sway"),
         smooth_swing: cli.flag("smooth-swing"),
         stance_width: cli.f64("stance-width"),
+        max_swing_foot_speed: cli.f64("max-swing-speed"),
     };
 
     match mode {
@@ -412,6 +416,11 @@ struct GaitTune {
     smooth_swing: bool,
     /// Lateral stance widening (m). `None` keeps the detected stance.
     stance_width: Option<f64>,
+    /// Swing-foot feasibility cap (m/s): auto-reduces forward speed so a high
+    /// `four_support` doesn't make the swing foot move faster than the
+    /// actuators can track (which shakes the body). `None` keeps the crawl
+    /// preset default (3.0); `Some(0.0)` disables the guard.
+    max_swing_foot_speed: Option<f64>,
 }
 
 /// Zero feedforward torque.
@@ -443,6 +452,11 @@ fn build_gait(
     cfg = cfg.with_smooth_swing(tune.smooth_swing);
     if let Some(w) = tune.stance_width {
         cfg = cfg.with_stance_width(w);
+    }
+    if let Some(m) = tune.max_swing_foot_speed {
+        // `with_max_swing_foot_speed` clamps to >= 0, so `--max-swing-speed 0`
+        // disables the guard (legacy unbounded swing).
+        cfg = cfg.with_max_swing_foot_speed(m);
     }
     let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
     ctrl.set_knee_pattern(KneePattern::BothBack);
@@ -873,8 +887,8 @@ fn run_hardware(
     ctrl.reset();
 
     eprintln!(
-        "go2-gait-runner: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} grav_ff={ff} ff_scale={ff_scale} smooth_swing={} level_gain={level_gain} CoM=({:.3},{:.3})",
-        tune.cycle_s, tune.four_support, tune.smooth_swing, com.x, com.y
+        "go2-gait-runner: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} cycle={:?} four_support={:?} max_swing_speed={:?} grav_ff={ff} ff_scale={ff_scale} smooth_swing={} level_gain={level_gain} CoM=({:.3},{:.3})",
+        tune.cycle_s, tune.four_support, tune.max_swing_foot_speed, tune.smooth_swing, com.x, com.y
     );
     eprintln!("  sport_mode released via native RPC (unless --no-release); ensure the area is clear ...");
 
