@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
-description = "Headless runner: drive quadruped-gait on a real Unitree Go2 via unitree-sdk-rs."
+description = "Headless CLI to run articara/quadruped-gait controllers on a real Unitree Go2 — low-level rt/lowcmd at 500 Hz via unitree-sdk-rs."
 
 [dependencies]
 quadruped-gait = { path = "../articara/quadruped-gait" }
