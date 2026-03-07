@@ -1412,7 +1412,8 @@ fn run_hardware(
             let mut hdr = String::from(
                 "t_s,phase,roll,pitch,yaw,gyro_x,gyro_y,gyro_z,acc_x,acc_y,acc_z,\
                  quat_w,quat_x,quat_y,quat_z,imu_temp,power_v,power_a,\
-                 foot0,foot1,foot2,foot3,cmd_vx,cmd_vy,cmd_wz",
+                 foot0,foot1,foot2,foot3,cmd_vx,cmd_vy,cmd_wz,\
+                 support,FR_state,FL_state,RR_state,RL_state",
             );
             for nm in jnames.iter() {
                 hdr.push_str(&format!(",{nm}_cmd,{nm}_q,{nm}_dq,{nm}_tau"));
@@ -1445,6 +1446,10 @@ fn run_hardware(
     let record = |sample: Option<&LowState>,
                       q_cmd: &[f64; 12],
                       vel: VelocityCmd,
+                      // Target contact schedule for this tick, canonical
+                      // LegId::ALL order [FL, FR, RL, RR]. `true` = stance
+                      // (foot planted), `false` = swing (leg in the air).
+                      stance: [bool; 4],
                       phase: &str,
                       t: f64,
                       err_sum: &mut [f64; 12],
@@ -1508,6 +1513,17 @@ fn run_hardware(
                     s.foot_force[0], s.foot_force[1], s.foot_force[2], s.foot_force[3],
                     vel.vx, vel.vy, vel.wz,
                 );
+                // Overall support state + per-leg target swing/stance. The
+                // count generalises to any gait (4/3/2/1/0 legs planted);
+                // per-leg columns are in the Go2 motor order used for the
+                // joint columns (FR, FL, RR, RL), mapped from canonical
+                // [FL, FR, RL, RR].
+                let n_support = stance.iter().filter(|&&c| c).count();
+                let st = |c: bool| if c { "stance" } else { "swing" };
+                row.push_str(&format!(
+                    ",{n_support}-support,{},{},{},{}",
+                    st(stance[1]), st(stance[0]), st(stance[3]), st(stance[2]),
+                ));
                 for j in 0..12 {
                     let m = &s.motor_state[j];
                     row.push_str(&format!(
@@ -1653,7 +1669,7 @@ fn run_hardware(
         let sample = poll_state!();
         let (q, tau) = gait_qtau!();
         emit(&q, &tau, kp, kd)?;
-        record(sample.as_ref(), &q, cmd_vel, "B", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
+        record(sample.as_ref(), &q, cmd_vel, last_stance, "B", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
     }
 
     // Phase C: forward, recording.
@@ -1666,7 +1682,7 @@ fn run_hardware(
             let sample = poll_state!();
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
-            record(sample.as_ref(), &q, cmd_vel, "C", b_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
+            record(sample.as_ref(), &q, cmd_vel, last_stance, "C", b_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
         }
         cmd_vel = VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 };
         ctrl.set_velocity_cmd(cmd_vel);
@@ -1674,7 +1690,7 @@ fn run_hardware(
             let sample = poll_state!();
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
-            record(sample.as_ref(), &q, cmd_vel, "C", b_dur + accel_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
+            record(sample.as_ref(), &q, cmd_vel, last_stance, "C", b_dur + accel_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
         }
         for i in 0..accel_n {
             let v = vx_target * (1.0 - i as f64 / accel_n as f64);
