@@ -308,6 +308,8 @@ MODES:
   util <cmd> <mode> <iface>  Auxiliary device commands (not gait playback):
                   util lidar <on|off> <iface>  toggle the L1 LiDAR
                   (publishes ON/OFF to rt/utlidar/switch).
+                  util led <on|off|0..10> <iface>  head LED: on/off switch or
+                  brightness 0..10 (vui service; white only, no colour).
 
 FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --misa PATH       model .misa file        (default models/unitree_go2/go2.misa)
@@ -574,8 +576,21 @@ fn run_util(cli: &Cli) -> Result<(), String> {
             }
             util_lidar(&iface, on)
         }
-        "" => Err("usage: go2-gait-runner util <cmd> <mode> <iface>   (cmd: lidar)".into()),
-        other => Err(format!("unknown util cmd {other:?} (supported: lidar)")),
+        "led" => {
+            // `util led <on|off|0..10> <iface>`: on/off toggles the head-LED
+            // switch; a 0..10 level sets its brightness (white only — VUI has
+            // no colour/RGB control).
+            if mode.is_empty() {
+                return Err("usage: go2-gait-runner util led <on|off|0..10> <iface>".into());
+            }
+            let iface = cli.positionals.get(3).cloned().unwrap_or_default();
+            if iface.is_empty() {
+                return Err("usage: go2-gait-runner util led <on|off|0..10> <iface>".into());
+            }
+            util_led(&iface, mode)
+        }
+        "" => Err("usage: go2-gait-runner util <cmd> <mode> <iface>   (cmd: lidar|led)".into()),
+        other => Err(format!("unknown util cmd {other:?} (supported: lidar, led)")),
     }
 }
 
@@ -588,6 +603,43 @@ fn util_lidar(iface: &str, on: bool) -> Result<(), String> {
         "LiDAR {} (published to rt/utlidar/switch)",
         if on { "ON" } else { "OFF" }
     );
+    Ok(())
+}
+
+/// Go2 VUI service (`rt/api/vui/request`) — same RPC envelope as the
+/// motion_switcher used for sport_mode. Drives the head LED (brightness /
+/// switch). API ids verified against `unitree_sdk2`'s `vui_api.hpp`.
+const VUI_SERVICE: &str = "vui";
+const VUI_API_ID_SET_SWITCH: i64 = 1001;
+const VUI_API_ID_SET_BRIGHTNESS: i64 = 1005;
+
+/// Head-LED control via the VUI service. `mode` is `on`/`off` (switch, api 1001,
+/// `{"enable":0|1}`) or a `0..=10` brightness level (api 1005,
+/// `{"brightness":N}`). VUI exposes brightness only — there is no colour/RGB.
+fn util_led(iface: &str, mode: &str) -> Result<(), String> {
+    let rpc = unitree_rpc::RpcClient::new(VUI_SERVICE, iface).map_err(|e| e.to_string())?;
+    match mode {
+        "on" | "off" => {
+            let enable = i32::from(mode == "on");
+            rpc.call(VUI_API_ID_SET_SWITCH, &format!("{{\"enable\":{enable}}}"))
+                .map_err(|e| e.to_string())?;
+            eprintln!("head LED {} (vui SetSwitch, enable={enable})", mode.to_uppercase());
+        }
+        _ => {
+            let level: i32 = mode
+                .parse()
+                .map_err(|_| format!("led mode must be on|off|0..10 (got {mode:?})"))?;
+            if !(0..=10).contains(&level) {
+                return Err(format!("led brightness must be 0..10 (got {level})"));
+            }
+            rpc.call(
+                VUI_API_ID_SET_BRIGHTNESS,
+                &format!("{{\"brightness\":{level}}}"),
+            )
+            .map_err(|e| e.to_string())?;
+            eprintln!("head LED brightness = {level}/10 (vui SetBrightness)");
+        }
+    }
     Ok(())
 }
 
