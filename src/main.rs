@@ -305,6 +305,9 @@ MODES:
   release <iface> Deactivate sport_mode (native RPC; replaces go2_motion_ctrl).
   restore <iface> Re-select \"normal\" so the onboard controller takes over.
   checkmode <iface>  Print the currently active motion mode.
+  util <cmd> <mode> <iface>  Auxiliary device commands (not gait playback):
+                  util lidar <on|off> <iface>  toggle the L1 LiDAR
+                  (publishes ON/OFF to rt/utlidar/switch).
 
 FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --misa PATH       model .misa file        (default models/unitree_go2/go2.misa)
@@ -531,14 +534,61 @@ fn main() {
                 }
             }
         }
+        "util" => {
+            // Auxiliary device/utility commands, grouped so they don't clutter
+            // the gait-playback modes: `util <cmd> <mode> <iface>`.
+            if let Err(e) = run_util(&cli) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         other => {
             eprintln!(
-                "usage: go2-gait-runner <dump|intent|run|diag|release|restore|checkmode> ...   \
+                "usage: go2-gait-runner <dump|intent|run|diag|release|restore|checkmode|util> ...   \
                  (got mode {other:?})"
             );
             std::process::exit(2);
         }
     }
+}
+
+/// `util <cmd> <mode> <iface>` — auxiliary device commands kept out of the
+/// gait-playback path. Currently: `util lidar <on|off> <iface>`.
+fn run_util(cli: &Cli) -> Result<(), String> {
+    let cmd = cli.positionals.get(1).map(|s| s.as_str()).unwrap_or("");
+    let mode = cli.positionals.get(2).map(|s| s.as_str()).unwrap_or("");
+    match cmd {
+        "lidar" => {
+            let on = match mode {
+                "on" => true,
+                "off" => false,
+                _ => {
+                    return Err(format!(
+                        "usage: go2-gait-runner util lidar <on|off> <iface>   (got mode {mode:?})"
+                    ))
+                }
+            };
+            let iface = cli.positionals.get(3).cloned().unwrap_or_default();
+            if iface.is_empty() {
+                return Err("usage: go2-gait-runner util lidar <on|off> <iface>".into());
+            }
+            util_lidar(&iface, on)
+        }
+        "" => Err("usage: go2-gait-runner util <cmd> <mode> <iface>   (cmd: lidar)".into()),
+        other => Err(format!("unknown util cmd {other:?} (supported: lidar)")),
+    }
+}
+
+/// Toggle the Go2 L1 LiDAR via the `rt/utlidar/switch` topic. `set_on` waits up
+/// to 2 s for the onboard utlidar node to match before publishing.
+fn util_lidar(iface: &str, on: bool) -> Result<(), String> {
+    let sw = unitree_go2::UtlidarSwitch::new(iface).map_err(|e| e.to_string())?;
+    sw.set_on(on).map_err(|e| e.to_string())?;
+    eprintln!(
+        "LiDAR {} (published to rt/utlidar/switch)",
+        if on { "ON" } else { "OFF" }
+    );
+    Ok(())
 }
 
 /// First positional after the mode, or exit with a usage error.
