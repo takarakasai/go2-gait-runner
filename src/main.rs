@@ -22,6 +22,107 @@ use unitree_go2::{
     init_lowcmd, joint, set_crc, topics, LowState, Participant, ReaderQos, WriterQos,
 };
 
+/// Live gait-visualization config (`--viz` / `--viz-key` / `--viz-rate` /
+/// `--viz-endpoint`).
+#[derive(Clone)]
+struct VizCfg {
+    enabled: bool,
+    key: String,
+    rate_hz: f64,
+    /// Optional Zenoh **listen** endpoint (e.g. `tcp/0.0.0.0:7447`). Set this
+    /// when multicast peer discovery isn't available (same host / WSL2 / no
+    /// multicast); the viewer then connects to it. `None` = auto-discovery.
+    endpoint: Option<String>,
+}
+
+/// Zenoh publisher for the live gait stream (`--viz`). Best-effort: publish
+/// errors are ignored so visualization can never disturb the control loop.
+#[cfg(feature = "viz")]
+mod viz_pub {
+    use quadruped_gait::viz::GaitVizFrame;
+    use quadruped_gait::ControllerOutput;
+    use zenoh::Wait;
+
+    pub struct VizPublisher {
+        session: zenoh::Session,
+        key: String,
+        seq: u64,
+        period: u32, // publish every `period` control ticks
+        since: u32,
+    }
+
+    impl VizPublisher {
+        /// Open a Zenoh session publishing on `key` at ~`rate_hz`, given the
+        /// control timestep `dt`. With `endpoint = Some(ep)` the session listens
+        /// on `ep` (TCP) and disables multicast discovery — use this on hosts
+        /// without working multicast (the viewer connects to `ep`).
+        pub fn new(
+            key: &str,
+            rate_hz: f64,
+            dt: f64,
+            endpoint: Option<&str>,
+        ) -> Result<Self, String> {
+            let mut config = zenoh::Config::default();
+            if let Some(ep) = endpoint {
+                config
+                    .insert_json5("listen/endpoints", &format!("[\"{ep}\"]"))
+                    .map_err(|e| format!("zenoh listen endpoint '{ep}': {e}"))?;
+                let _ = config.insert_json5("scouting/multicast/enabled", "false");
+            }
+            let session = zenoh::open(config)
+                .wait()
+                .map_err(|e| format!("zenoh open: {e}"))?;
+            let period = ((1.0 / rate_hz.max(1.0)) / dt).round().max(1.0) as u32;
+            Ok(Self {
+                session,
+                key: key.to_string(),
+                seq: 0,
+                period,
+                since: 0,
+            })
+        }
+
+        pub fn key(&self) -> &str {
+            &self.key
+        }
+
+        /// Call every control tick; publishes a JSON [`GaitVizFrame`] at the
+        /// configured (downsampled) rate. `signs` is the IK→model sign table
+        /// (slot × joint, from `joint_signs`): the controller output is in the
+        /// gait/IK convention, so we sign-correct the joints to the model/URDF
+        /// convention — exactly what `output_to_go2` sends to the robot — so a
+        /// viewer setting `joint_positions` directly renders the *commanded*
+        /// pose (e.g. knees bend `<<`, not the IK-sign-flipped `>>`).
+        pub fn publish(
+            &mut self,
+            t_s: f64,
+            trunk_z: f64,
+            out: &ControllerOutput,
+            signs: &[[f64; 3]; 4],
+        ) {
+            self.since += 1;
+            if self.since < self.period {
+                return;
+            }
+            self.since = 0;
+            let mut frame = GaitVizFrame::from_output(self.seq, t_s, trunk_z, out);
+            for slot in 0..4 {
+                for k in 0..3 {
+                    frame.joints[3 * slot + k] *= signs[slot][k];
+                }
+            }
+            self.seq += 1;
+            if let Ok(json) = serde_json::to_vec(&frame) {
+                let _ = self
+                    .session
+                    .put(&self.key, json)
+                    .encoding(zenoh::bytes::Encoding::APPLICATION_JSON)
+                    .wait();
+            }
+        }
+    }
+}
+
 /// Go2 standing-crouch joint angles (Menagerie `home` keyframe): the pose at
 /// which the gait's nominal stance plane should sit.
 const HOME_HIP: f64 = 0.0;
@@ -86,7 +187,9 @@ struct Cli {
 }
 
 /// Named flags that act as presence booleans (no value consumed).
-const BOOL_FLAGS: &[&str] = &["ff", "grav-ff", "no-release", "restore", "smooth-swing", "level"];
+const BOOL_FLAGS: &[&str] = &[
+    "ff", "grav-ff", "no-release", "restore", "smooth-swing", "level", "viz",
+];
 
 fn parse_cli(args: impl Iterator<Item = String>) -> Cli {
     let mut positionals = Vec::new();
@@ -231,6 +334,14 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --ff              enable body-weight support feedforward      [run/diag]
   --ff-scale S      fraction of body weight to support, 1.0=full (default 1.0) [run/diag]
   --csv PATH        write full per-tick telemetry CSV           [run/diag]
+  --viz             stream the generated gait over Zenoh for live viewing in
+                    the articara GUI (key go2/gait/planned, JSON). On `intent`
+                    it streams offline in real time (no robot)  [run/diag/intent]
+  --viz-key K       Zenoh key to publish on (default go2/gait/planned)
+  --viz-rate HZ     viz publish rate, Hz (default 100)
+  --viz-endpoint EP Zenoh listen endpoint (e.g. tcp/0.0.0.0:7447) for hosts
+                    without multicast (same PC / WSL2); the viewer connects to
+                    it. Default: auto multicast discovery (works on a LAN).
   --no-release      do NOT auto-release sport_mode at startup   [run/diag]
   --restore         re-activate sport_mode after the run        [run/diag]
   -h, --help        show this help
@@ -302,8 +413,19 @@ fn main() {
         "intent" => {
             // `intent [--misa P] [--vx V] [--swing H] [--cycle S] [--four-support F]`
             // Offline: quantify the gait's forward displacement, foot sweep, lift.
+            // With `--viz` it then streams the gait in real time (no robot) so
+            // the articara GUI can preview it.
             let vx = cli.f64("vx").unwrap_or(0.05);
-            if let Err(e) = run_intent(&misa, vx, tune) {
+            let viz_cfg = VizCfg {
+                enabled: cli.flag("viz"),
+                key: cli
+                    .str("viz-key")
+                    .unwrap_or(quadruped_gait::viz::VIZ_KEY_PLANNED)
+                    .to_string(),
+                rate_hz: cli.f64("viz-rate").unwrap_or(100.0),
+                endpoint: cli.str("viz-endpoint").map(|s| s.to_string()),
+            };
+            if let Err(e) = run_intent(&misa, vx, tune, &viz_cfg) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -336,6 +458,15 @@ fn main() {
                 0.0
             };
             let csv = cli.str("csv");
+            let viz_cfg = VizCfg {
+                enabled: cli.flag("viz"),
+                key: cli
+                    .str("viz-key")
+                    .unwrap_or(quadruped_gait::viz::VIZ_KEY_PLANNED)
+                    .to_string(),
+                rate_hz: cli.f64("viz-rate").unwrap_or(100.0),
+                endpoint: cli.str("viz-endpoint").map(|s| s.to_string()),
+            };
 
             // Deactivate sport_mode before low-level control unless told not to.
             // Without this the onboard controller fights rt/lowcmd and the joints
@@ -355,6 +486,7 @@ fn main() {
             // and print the tracking/tilt summary. `diag` is kept as an alias.
             let res = run_hardware(
                 &iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale, level_gain, csv,
+                &viz_cfg,
             );
             if let Err(e) = res {
                 eprintln!("error: {e}");
@@ -723,7 +855,12 @@ fn level_correction(
 
 /// Offline: quantify what the gait *intends* — per-cycle forward trunk
 /// displacement, the swing foot lift, and the stance foot fore/aft sweep.
-fn run_intent(misa_path: &str, vx: f64, tune: GaitTune) -> Result<(), String> {
+fn run_intent(
+    misa_path: &str,
+    vx: f64,
+    tune: GaitTune,
+    viz_cfg: &VizCfg,
+) -> Result<(), String> {
     let swing_h = tune.swing_h;
     let (model, home_q, mut ctrl, signs) = build_gait(misa_path, tune)?;
     let cycle = ctrl.config().cycle_period_s;
@@ -812,6 +949,48 @@ fn run_intent(misa_path: &str, vx: f64, tune: GaitTune) -> Result<(), String> {
     if net.abs() < 1e-4 {
         eprintln!("  WARNING: body_x does not advance — forward intent is ~0 in the open-loop trunk.");
     }
+
+    // ── Offline live-viz loop (`--viz`) ─────────────────────────
+    // No robot: tick the gait in real time and publish each frame so the
+    // articara GUI can preview the generated gait. Runs until interrupted.
+    #[cfg(feature = "viz")]
+    if viz_cfg.enabled {
+        let mut viz = viz_pub::VizPublisher::new(
+            &viz_cfg.key,
+            viz_cfg.rate_hz,
+            CONTROL_DT,
+            viz_cfg.endpoint.as_deref(),
+        )?;
+        let trunk_z = if matches!(tune.gait_mode, GaitMode::LinearCrawl) {
+            tune.stance_height
+        } else {
+            -ctrl.kinematics().fl.nominal_foot_body.z
+        };
+        eprintln!(
+            "viz: streaming offline gait on zenoh key '{}' (~{} Hz){} — Ctrl-C to stop",
+            viz_cfg.key,
+            viz_cfg.rate_hz,
+            viz_cfg
+                .endpoint
+                .as_deref()
+                .map(|e| format!(", listening on {e}"))
+                .unwrap_or_default(),
+        );
+        ctrl.reset();
+        ctrl.set_velocity_cmd(VelocityCmd { vx, vy: 0.0, wz: 0.0 });
+        let mut t = 0.0f64;
+        loop {
+            let out = ctrl.tick(CONTROL_DT);
+            t += CONTROL_DT;
+            viz.publish(t, trunk_z, &out, &signs);
+            std::thread::sleep(std::time::Duration::from_secs_f64(CONTROL_DT));
+        }
+    }
+    #[cfg(not(feature = "viz"))]
+    if viz_cfg.enabled {
+        eprintln!("viz: --viz ignored (binary built without the `viz` feature)");
+    }
+
     Ok(())
 }
 
@@ -1046,6 +1225,7 @@ fn run_hardware(
     ff_scale: f64,
     level_gain: f64,
     csv_path: Option<&str>,
+    viz_cfg: &VizCfg,
 ) -> Result<(), String> {
     use std::io::Write as _;
     let swing_h = tune.swing_h;
@@ -1253,6 +1433,51 @@ fn run_hardware(
     let mut observer = BodyObserver::new();
     let mut last_stance = [true; 4];
 
+    // Live gait-visualization publisher (`--viz`): stream each tick's gait
+    // frame over Zenoh for the articara GUI. The trunk-height shown is the
+    // gait's body height above the feet (the controller output is horizontal).
+    #[cfg(feature = "viz")]
+    let viz_trunk_z = if matches!(tune.gait_mode, GaitMode::LinearCrawl) {
+        tune.stance_height
+    } else {
+        -kin_obs.fl.nominal_foot_body.z
+    };
+    #[cfg(feature = "viz")]
+    let mut viz_t = 0.0f64;
+    #[cfg(feature = "viz")]
+    let mut viz = if viz_cfg.enabled {
+        match viz_pub::VizPublisher::new(
+            &viz_cfg.key,
+            viz_cfg.rate_hz,
+            CONTROL_DT,
+            viz_cfg.endpoint.as_deref(),
+        ) {
+            Ok(v) => {
+                eprintln!(
+                    "viz: publishing gait frames on zenoh key '{}' (~{} Hz){}",
+                    v.key(),
+                    viz_cfg.rate_hz,
+                    viz_cfg
+                        .endpoint
+                        .as_deref()
+                        .map(|e| format!(", listening on {e}"))
+                        .unwrap_or_default(),
+                );
+                Some(v)
+            }
+            Err(e) => {
+                eprintln!("viz: disabled — {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "viz"))]
+    if viz_cfg.enabled {
+        eprintln!("viz: --viz ignored (binary built without the `viz` feature)");
+    }
+
     // Tick the gait, map to Go2 order, compute optional support FF, and apply
     // the optional IMU body-leveling correction (drives measured roll/pitch
     // toward zero by trimming the stance feet — see `level_correction`).
@@ -1266,6 +1491,13 @@ fn run_hardware(
                 out.legs[2].phase.is_stance,
                 out.legs[3].phase.is_stance,
             ];
+            #[cfg(feature = "viz")]
+            {
+                viz_t += CONTROL_DT;
+                if let Some(v) = viz.as_mut() {
+                    v.publish(viz_t, viz_trunk_z, &out, &signs);
+                }
+            }
             let mut q = output_to_go2(&out, &signs)?;
             let tau = if ff {
                 support_tau_go2(&out, ctrl.kinematics(), &signs, weight, com_xy)
