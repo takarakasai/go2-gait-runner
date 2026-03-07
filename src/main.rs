@@ -1310,7 +1310,7 @@ fn run_hardware(
             let mut hdr = String::from(
                 "t_s,phase,roll,pitch,yaw,gyro_x,gyro_y,gyro_z,acc_x,acc_y,acc_z,\
                  quat_w,quat_x,quat_y,quat_z,imu_temp,power_v,power_a,\
-                 foot0,foot1,foot2,foot3",
+                 foot0,foot1,foot2,foot3,cmd_vx,cmd_vy,cmd_wz",
             );
             for nm in jnames.iter() {
                 hdr.push_str(&format!(",{nm}_cmd,{nm}_q,{nm}_dq,{nm}_tau"));
@@ -1342,6 +1342,7 @@ fn run_hardware(
     // feedback) so the reader isn't drained twice per tick.
     let record = |sample: Option<&LowState>,
                       q_cmd: &[f64; 12],
+                      vel: VelocityCmd,
                       phase: &str,
                       t: f64,
                       err_sum: &mut [f64; 12],
@@ -1396,13 +1397,14 @@ fn run_hardware(
                 let im = &s.imu_state;
                 let mut row = format!(
                     "{t:.4},{phase},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},\
-                     {:.6},{:.6},{:.6},{:.6},{},{:.3},{:.3},{},{},{},{}",
+                     {:.6},{:.6},{:.6},{:.6},{},{:.3},{:.3},{},{},{},{},{:.5},{:.5},{:.5}",
                     im.rpy[0], im.rpy[1], im.rpy[2],
                     im.gyroscope[0], im.gyroscope[1], im.gyroscope[2],
                     im.accelerometer[0], im.accelerometer[1], im.accelerometer[2],
                     im.quaternion[0], im.quaternion[1], im.quaternion[2], im.quaternion[3],
                     im.temperature, s.power_v, s.power_a,
                     s.foot_force[0], s.foot_force[1], s.foot_force[2], s.foot_force[3],
+                    vel.vx, vel.vy, vel.wz,
                 );
                 for j in 0..12 {
                     let m = &s.motor_state[j];
@@ -1539,13 +1541,17 @@ fn run_hardware(
         }};
     }
 
-    // Phase B: in-place (vx=0), recording.
-    ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
+    // Phase B: in-place (vx=0), recording. `cmd_vel` mirrors the velocity sent
+    // to the gait generator each tick so `record` can log it (CSV cmd_* cols).
+    // Today this is driven by the CLI `vx_target`; when an external Twist source
+    // is wired in it will write the same `cmd_vel` and the columns stay valid.
+    let mut cmd_vel = VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 };
+    ctrl.set_velocity_cmd(cmd_vel);
     for i in 0..ticks(inplace_secs) {
         let sample = poll_state!();
         let (q, tau) = gait_qtau!();
         emit(&q, &tau, kp, kd)?;
-        record(sample.as_ref(), &q, "B", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
+        record(sample.as_ref(), &q, cmd_vel, "B", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
     }
 
     // Phase C: forward, recording.
@@ -1553,22 +1559,25 @@ fn run_hardware(
         let accel_n = ticks(ACCEL_SECS);
         for i in 0..accel_n {
             let v = vx_target * (i as f64 / accel_n as f64);
-            ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
+            cmd_vel = VelocityCmd { vx: v, vy: 0.0, wz: 0.0 };
+            ctrl.set_velocity_cmd(cmd_vel);
             let sample = poll_state!();
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
-            record(sample.as_ref(), &q, "C", b_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
+            record(sample.as_ref(), &q, cmd_vel, "C", b_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
         }
-        ctrl.set_velocity_cmd(VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 });
+        cmd_vel = VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 };
+        ctrl.set_velocity_cmd(cmd_vel);
         for i in 0..ticks(forward_secs) {
             let sample = poll_state!();
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
-            record(sample.as_ref(), &q, "C", b_dur + accel_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
+            record(sample.as_ref(), &q, cmd_vel, "C", b_dur + accel_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
         }
         for i in 0..accel_n {
             let v = vx_target * (1.0 - i as f64 / accel_n as f64);
-            ctrl.set_velocity_cmd(VelocityCmd { vx: v, vy: 0.0, wz: 0.0 });
+            cmd_vel = VelocityCmd { vx: v, vy: 0.0, wz: 0.0 };
+            ctrl.set_velocity_cmd(cmd_vel);
             let _sample = poll_state!();
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
