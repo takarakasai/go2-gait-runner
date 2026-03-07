@@ -19,6 +19,15 @@ misarta = { git = "ssh://git@github.com/takarakasai/articara.git", package = "mi
 unitree-go2 = { git = "ssh://git@github.com/takarakasai/unitree-sdk-rs.git", package = "unitree-go2" }
 unitree-rpc = { git = "ssh://git@github.com/takarakasai/unitree-sdk-rs.git", package = "unitree-rpc" }
 nalgebra = "0.34.2"
+# Live gait visualization (`--viz`): publish each tick's gait frame over Zenoh
+# (pure-Rust pub/sub) for the articara GUI to render. Optional — disable with
+# `--no-default-features` to drop Zenoh + its runtime from the build.
+zenoh = { version = "1.9", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = ["viz"]
+viz = ["dep:zenoh", "dep:serde_json", "quadruped-gait/viz"]
 
 # Own workspace root so cargo doesn't try to inherit a parent workspace.
 [workspace]
