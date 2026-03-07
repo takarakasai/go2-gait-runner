@@ -188,7 +188,7 @@ struct Cli {
 
 /// Named flags that act as presence booleans (no value consumed).
 const BOOL_FLAGS: &[&str] = &[
-    "ff", "grav-ff", "no-release", "restore", "smooth-swing", "level", "viz",
+    "ff", "grav-ff", "no-release", "restore", "smooth-swing", "level", "viz", "led-3support",
 ];
 
 fn parse_cli(args: impl Iterator<Item = String>) -> Cli {
@@ -334,6 +334,10 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --max-swing-speed V  cap peak swing-foot speed, m/s: auto-slows forward speed
                     so a high --four-support doesn't shake the body (default 3.0;
                     0 = disable = legacy unbounded). Slowing --cycle does NOT help.
+  --led-3support    light the head LED during the 3-leg support period (and the
+                    --led-margin window before/after it)            [run/diag]
+  --led-margin S    seconds before/after the 3-support period to keep the LED
+                    lit (default 0.1)                               [run/diag]
   --level           active IMU body-leveling: trim stance feet to hold trunk flat
   --level-gain G    leveling strength, signed (default 0.3; negate if it worsens)
   --ff              enable body-weight support feedforward      [run/diag]
@@ -463,6 +467,10 @@ fn main() {
                 0.0
             };
             let csv = cli.str("csv");
+            // Head-LED 3-support indicator: light the LED during the 3-leg
+            // support period and `--led-margin` seconds before/after it.
+            let led_3support = cli.flag("led-3support");
+            let led_margin = cli.f64("led-margin").unwrap_or(0.1);
             let viz_cfg = VizCfg {
                 enabled: cli.flag("viz"),
                 key: cli
@@ -491,7 +499,7 @@ fn main() {
             // and print the tracking/tilt summary. `diag` is kept as an alias.
             let res = run_hardware(
                 &iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale, level_gain, csv,
-                &viz_cfg,
+                &viz_cfg, led_3support, led_margin,
             );
             if let Err(e) = res {
                 eprintln!("error: {e}");
@@ -1328,6 +1336,8 @@ fn run_hardware(
     level_gain: f64,
     csv_path: Option<&str>,
     viz_cfg: &VizCfg,
+    led_3support: bool,
+    led_margin: f64,
 ) -> Result<(), String> {
     use std::io::Write as _;
     let swing_h = tune.swing_h;
@@ -1360,6 +1370,68 @@ fn run_hardware(
         .map_err(|e| format!("reader: {e}"))?;
 
     let start = wait_for_start_pose(&reader)?;
+
+    // ── Head-LED 3-support indicator (`--led-3support`) ──────────────
+    // The LED is driven over the VUI service, whose RPC is request/response
+    // (it blocks until a reply or times out). Calling it from the 500 Hz loop
+    // would stall control, so a background thread owns the VUI client and the
+    // control loop only sends a target brightness (0/10) when it changes.
+    //
+    // The VUI client is created *here*, after the gait `dp` participant above,
+    // so its identical `CYCLONEDDS_URI` (same iface) doesn't disturb the
+    // already-built control participant; both then coexist on domain 0.
+    let (led_tx, led_handle) = if led_3support {
+        let (tx, rx) = std::sync::mpsc::channel::<i32>();
+        let iface_led = iface.to_string();
+        let h = std::thread::spawn(move || {
+            let rpc = match unitree_rpc::RpcClient::new(VUI_SERVICE, &iface_led) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("led: vui connect failed: {e} (3-support LED disabled)");
+                    return;
+                }
+            };
+            let _ = rpc.call(VUI_API_ID_SET_SWITCH, "{\"enable\":1}"); // LED switch on
+            let _ = rpc.call(VUI_API_ID_SET_BRIGHTNESS, "{\"brightness\":0}"); // start dark
+            let mut last = 0i32;
+            // Block for the next target; coalesce to the newest so a burst of
+            // changes collapses to one RPC.
+            while let Ok(first) = rx.recv() {
+                let mut level = first;
+                while let Ok(l) = rx.try_recv() {
+                    level = l;
+                }
+                if level != last {
+                    let _ = rpc.call(VUI_API_ID_SET_BRIGHTNESS, &format!("{{\"brightness\":{level}}}"));
+                    last = level;
+                }
+            }
+            let _ = rpc.call(VUI_API_ID_SET_BRIGHTNESS, "{\"brightness\":0}"); // off on exit
+        });
+        eprintln!("led: 3-support indicator ON (margin {led_margin:.3}s; brightness 10/0 via vui)");
+        (Some(tx), Some(h))
+    } else {
+        (None, None)
+    };
+    // Preview controller, advanced `led_margin` ahead of the real gait, so the
+    // LED can be lit *before* a 3-support period begins. The gait is
+    // deterministic, so a shadow copy ticked ahead yields the upcoming contact
+    // schedule. Contact *timing* is governed by the gait clock (independent of
+    // velocity magnitude), so a fixed vx=0 preview gives the right timing.
+    let led_margin_ticks = (led_margin / CONTROL_DT).round().max(0.0) as u32;
+    let mut led_preview = if led_3support {
+        let (_m, _hq, mut pc, _s) = build_gait(misa_path, tune)?;
+        pc.reset();
+        pc.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
+        for _ in 0..led_margin_ticks {
+            pc.tick(CONTROL_DT);
+        }
+        Some(pc)
+    } else {
+        None
+    };
+    let mut led_hold = 0u32; // ticks remaining of the post (直後) margin
+    let mut led_prev = -1i32; // last brightness sent (force first send)
 
     let mut cmd = init_lowcmd();
     let loop_start = Instant::now();
@@ -1632,6 +1704,28 @@ fn run_hardware(
                     q[j] += dq[j];
                 }
             }
+            // Head-LED 3-support indicator. `now` is this tick's support count;
+            // `fut` is the preview (led_margin ahead) → lights *before* a
+            // 3-support starts. A hold timer keeps it on `led_margin` *after* it
+            // ends. Only a changed brightness is sent (the thread does the RPC).
+            if let Some(pc) = led_preview.as_mut() {
+                let pv = pc.tick(CONTROL_DT);
+                let fut = pv.legs.iter().filter(|l| l.phase.is_stance).count();
+                let now = last_stance.iter().filter(|&&s| s).count();
+                let trigger = now == 3 || fut == 3;
+                if trigger {
+                    led_hold = led_margin_ticks;
+                } else if led_hold > 0 {
+                    led_hold -= 1;
+                }
+                let want = if trigger || led_hold > 0 { 10 } else { 0 };
+                if want != led_prev {
+                    if let Some(tx) = led_tx.as_ref() {
+                        let _ = tx.send(want);
+                    }
+                    led_prev = want;
+                }
+            }
             (q, tau)
         }};
     }
@@ -1715,6 +1809,16 @@ fn run_hardware(
     }
     for _ in 0..ticks(0.5) {
         emit(&LIE_POS, &ZERO_TAU, kp, kd)?;
+    }
+
+    // Stop the LED thread: blank the LED, then close the channel so its
+    // `recv` returns and the thread exits; join so its final RPC completes.
+    if let Some(tx) = led_tx.as_ref() {
+        let _ = tx.send(0);
+    }
+    drop(led_tx);
+    if let Some(h) = led_handle {
+        let _ = h.join();
     }
 
     // Summary.
