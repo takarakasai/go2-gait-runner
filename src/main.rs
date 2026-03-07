@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use misarta::model::Model;
 use quadruped_gait::{
     auto_detect_kinematics_config, joint_signs, AnyGaitController, ControllerOutput, GaitConfig,
-    GaitGenerator, GaitMode, KneePattern, LegId, VelocityCmd, DEFAULT_FOOT_LINKS,
+    GaitGenerator, GaitMode, GaitType, KneePattern, LegId, VelocityCmd, DEFAULT_FOOT_LINKS,
 };
 use unitree_go2::{
     init_lowcmd, joint, set_crc, topics, LowState, Participant, ReaderQos, WriterQos,
@@ -205,6 +205,12 @@ MODES:
 
 FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --misa PATH       model .misa file        (default models/unitree_go2/go2.misa)
+  --gait MODE       linear-crawl (default) | champ | mpc | centroidal-srbd |
+                    full-centroidal. champ/mpc are closed-loop on real-robot
+                    state (IMU + leg odometry); linear-crawl/champ are open-loop.
+  --gait-type T     footfall pattern for champ/mpc: trot|walk|pace|bound|crawl
+                    (default crawl for linear-crawl, trot otherwise; linear-crawl
+                    ignores the pattern but uses the preset's timing)
   --vx V            forward speed, m/s       (run/diag default 0.0; intent 0.05)
   --inplace S       in-place phase, seconds  (default 3)        [run/diag]
   --forward S       forward phase, seconds   (default 4)        [run/diag]
@@ -260,12 +266,35 @@ fn main() {
         stance_width: cli.f64("stance-width"),
         max_swing_foot_speed: cli.f64("max-swing-speed"),
         stance_height: cli.f64("stance-height").unwrap_or(0.35),
+        gait_mode: {
+            let m = cli
+                .str("gait")
+                .map(|s| {
+                    parse_gait_mode(s).unwrap_or_else(|| {
+                        eprintln!("error: unknown --gait {s:?} (linear-crawl|champ|mpc|centroidal-srbd|full-centroidal)");
+                        std::process::exit(1);
+                    })
+                })
+                .unwrap_or(GaitMode::LinearCrawl);
+            m
+        },
+        gait_type: {
+            let mode = cli.str("gait").and_then(parse_gait_mode).unwrap_or(GaitMode::LinearCrawl);
+            cli.str("gait-type")
+                .map(|s| {
+                    parse_gait_type(s).unwrap_or_else(|| {
+                        eprintln!("error: unknown --gait-type {s:?} (trot|walk|pace|bound|crawl)");
+                        std::process::exit(1);
+                    })
+                })
+                .unwrap_or_else(|| default_gait_type(mode))
+        },
     };
 
     match mode {
         "dump" => {
             // `dump [--misa P] [--stance-height M]`
-            if let Err(e) = run_dump(&misa, tune.stance_height) {
+            if let Err(e) = run_dump(&misa, tune) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -427,6 +456,45 @@ struct GaitTune {
     /// during the gait (LinearCrawl). Overrides the auto-detected nominal
     /// foot height. Default 0.35 m.
     stance_height: f64,
+    /// Which controller to run (`--gait`). Default [`GaitMode::LinearCrawl`].
+    gait_mode: GaitMode,
+    /// Footfall pattern / preset (`--gait-type`) for the CHAMP / MPC modes;
+    /// ignored by LinearCrawl (it uses its own diagonal sequence). Selects the
+    /// [`GaitConfig`] preset via [`GaitConfig::for_type`].
+    gait_type: GaitType,
+}
+
+/// Parse `--gait`. Accepts a few aliases per mode.
+fn parse_gait_mode(s: &str) -> Option<GaitMode> {
+    Some(match s.to_ascii_lowercase().as_str() {
+        "linear-crawl" | "linearcrawl" | "linear" => GaitMode::LinearCrawl,
+        "champ" => GaitMode::Champ,
+        "mpc" => GaitMode::Mpc,
+        "centroidal-srbd" | "centroidal" | "srbd" => GaitMode::CentroidalSrbd,
+        "full-centroidal" | "full" | "fullcentroidal" => GaitMode::FullCentroidal,
+        _ => return None,
+    })
+}
+
+/// Parse `--gait-type`.
+fn parse_gait_type(s: &str) -> Option<GaitType> {
+    Some(match s.to_ascii_lowercase().as_str() {
+        "trot" => GaitType::Trot,
+        "walk" => GaitType::Walk,
+        "pace" => GaitType::Pace,
+        "bound" => GaitType::Bound,
+        "crawl" => GaitType::Crawl,
+        _ => return None,
+    })
+}
+
+/// Default footfall pattern for a mode when `--gait-type` is omitted:
+/// `crawl` for the (statically stable) LinearCrawl, `trot` otherwise.
+fn default_gait_type(mode: GaitMode) -> GaitType {
+    match mode {
+        GaitMode::LinearCrawl => GaitType::Crawl,
+        _ => GaitType::Trot,
+    }
 }
 
 /// Zero feedforward torque.
@@ -445,7 +513,11 @@ fn build_gait(
     let kin = auto_detect_kinematics_config(&model, &DEFAULT_FOOT_LINKS, &home_q)
         .map_err(|errs| format!("kinematics auto-detect failed: {errs:?}"))?;
     let signs = joint_signs(&model, &kin)?;
-    let mut cfg = GaitConfig::crawl().with_swing_height(tune.swing_h);
+    // Select the preset for the requested footfall pattern (LinearCrawl
+    // defaults to `crawl`). CHAMP / MPC modes use the pattern's phase offsets;
+    // LinearCrawl ignores them but still uses the preset's cycle / swing /
+    // four-support sizing.
+    let mut cfg = GaitConfig::for_type(tune.gait_type).with_swing_height(tune.swing_h);
     if let Some(c) = tune.cycle_s {
         cfg = cfg.with_cycle_period(c);
     }
@@ -464,7 +536,7 @@ fn build_gait(
         // disables the guard (legacy unbounded swing).
         cfg = cfg.with_max_swing_foot_speed(m);
     }
-    let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
+    let mut ctrl = AnyGaitController::new(tune.gait_mode, cfg, kin);
     ctrl.set_knee_pattern(KneePattern::BothBack);
     // Hold the trunk at the requested stance height (overrides the
     // auto-detected nominal foot height). LinearCrawl only.
@@ -743,7 +815,7 @@ fn run_intent(misa_path: &str, vx: f64, tune: GaitTune) -> Result<(), String> {
     Ok(())
 }
 
-fn run_dump(misa_path: &str, stance_height: f64) -> Result<(), String> {
+fn run_dump(misa_path: &str, tune: GaitTune) -> Result<(), String> {
     // 1. Load the Go2 model straight from .misa (no articara).
     let parsed = misarta::native::load(misa_path).map_err(|e| format!("load {misa_path}: {e:?}"))?;
     let (model, _vis, _col) =
@@ -779,12 +851,12 @@ fn run_dump(misa_path: &str, stance_height: f64) -> Result<(), String> {
         );
     }
 
-    // 3. Build a LinearCrawl controller (statically stable; safest first gait).
-    let cfg = GaitConfig::crawl();
-    let mut ctrl = AnyGaitController::new(GaitMode::LinearCrawl, cfg, kin);
+    // 3. Build the requested gait (default LinearCrawl — statically stable).
+    let cfg = GaitConfig::for_type(tune.gait_type);
+    let mut ctrl = AnyGaitController::new(tune.gait_mode, cfg, kin);
     ctrl.set_knee_pattern(KneePattern::BothBack);
     // Check joint limits at the same stance height the gait will run at.
-    ctrl.set_body_height_m(stance_height);
+    ctrl.set_body_height_m(tune.stance_height);
 
     // 4. Run two phases: in-place (vx=0) then a slow forward crawl, and check
     //    every commanded angle (after sign correction) against the Go2 limits.
@@ -869,6 +941,94 @@ fn wait_for_start_pose(reader: &unitree_go2::Reader<LowState>) -> Result<[f64; 1
 ///
 /// Each B/C tick records the measured joint angles and body roll/pitch, and a
 /// per-joint tracking-error + body-tilt summary is printed at the end (use it to
+/// Read a gait-slot leg's `(q_hip, q_thigh, q_calf, q̇_hip, q̇_thigh, q̇_calf)`
+/// from the Go2 `LowState`, converted to the IK sign convention the
+/// kinematics use (`q_ik = q_motor · sign`, since `output_to_go2` applies the
+/// same `±1` going the other way). Slot order is FL,FR,RL,RR; the Go2 motor
+/// base index per slot is FR=0, FL=3, RR=6, RL=9 (see `go2_motor_index`).
+fn leg_q_dq_ik(s: &LowState, slot: usize, signs: &[[f64; 3]; 4]) -> (f64, f64, f64, f64, f64, f64) {
+    let base = match slot {
+        0 => 3, // FL
+        1 => 0, // FR
+        2 => 9, // RL
+        _ => 6, // RR
+    };
+    let sg = signs[slot];
+    let q = |k: usize| s.motor_state[base + k].q as f64 * sg[k];
+    let dq = |k: usize| s.motor_state[base + k].dq as f64 * sg[k];
+    (q(0), q(1), q(2), dq(0), dq(1), dq(2))
+}
+
+/// Kinematics-based observer of the body's world-frame velocity + pose, used to
+/// close the loop for the MPC gait modes (CHAMP / LinearCrawl ignore it).
+///
+/// Stance-foot odometry: a planted foot is fixed in the world, so the body
+/// velocity is the negated joint-driven foot velocity plus the `−ω×r` term,
+/// averaged over the stance legs (cf. `articara::leg_odometry`):
+/// ```text
+///   v_body = mean_stance( −J·q̇  −  ω_body × p_foot ),   v_world = R(yaw)·v_body
+/// ```
+/// Horizontal only (roll/pitch treated as level); position integrates v_world.
+struct BodyObserver {
+    pos: nalgebra::Vector3<f64>,
+}
+
+impl BodyObserver {
+    fn new() -> Self {
+        Self {
+            pos: nalgebra::Vector3::zeros(),
+        }
+    }
+
+    /// Feed yaw + angular/linear velocity + integrated position to `ctrl`.
+    /// `stance` is the previous tick's per-slot contact schedule.
+    fn feed(
+        &mut self,
+        ctrl: &mut AnyGaitController,
+        s: &LowState,
+        kin: &quadruped_gait::KinematicsConfig,
+        signs: &[[f64; 3]; 4],
+        stance: &[bool; 4],
+        dt: f64,
+    ) {
+        let yaw = s.imu_state.rpy[2] as f64;
+        let g = s.imu_state.gyroscope;
+        let omega_body = nalgebra::Vector3::new(g[0] as f64, g[1] as f64, g[2] as f64);
+
+        let mut v_sum = nalgebra::Vector3::zeros();
+        let mut n = 0u32;
+        for slot in 0..4 {
+            if !stance[slot] {
+                continue;
+            }
+            let (qh, qt, qc, dqh, dqt, dqc) = leg_q_dq_ik(s, slot, signs);
+            let lk = kin.leg(LegId::ALL[slot]);
+            let jac = quadruped_gait::foot_jacobian_body(lk, qh, qt, qc);
+            let qd = nalgebra::Vector3::new(dqh, dqt, dqc);
+            let p_foot = quadruped_gait::forward_leg_kinematics(lk, qh, qt, qc);
+            v_sum += -(jac * qd) - omega_body.cross(&p_foot);
+            n += 1;
+        }
+        let v_body = if n > 0 {
+            v_sum / n as f64
+        } else {
+            nalgebra::Vector3::zeros()
+        };
+
+        // Body→world by yaw only (horizontal).
+        let (sn, cs) = (yaw.sin(), yaw.cos());
+        let rot = |v: nalgebra::Vector3<f64>| {
+            nalgebra::Vector3::new(cs * v.x - sn * v.y, sn * v.x + cs * v.y, v.z)
+        };
+        let v_world = rot(v_body);
+        let omega_world = rot(omega_body);
+        self.pos += v_world * dt;
+
+        ctrl.set_body_state_observed(v_world, omega_world);
+        ctrl.set_body_pose_observed(yaw, self.pos);
+    }
+}
+
 /// size kp/kd: large stance tracking error ⇒ the legs sag under load ⇒ raise kp).
 /// With `csv_path` set, every recorded tick is also written as a full-telemetry
 /// CSV row. Both the `run` and `diag` CLI modes call this single path.
@@ -1085,12 +1245,27 @@ fn run_hardware(
     // resolves outer identifiers at the definition site).
     let mut last_rpy = [0.0f64; 3];
 
+    // Closed-loop observer for the MPC gait modes (no-op for the open-loop
+    // CHAMP / LinearCrawl). `kin_obs` is cloned so the observer can borrow it
+    // while the macros borrow `ctrl`; `last_stance` is the previous tick's
+    // contact schedule (the estimator runs before the current tick).
+    let kin_obs = ctrl.kinematics().clone();
+    let mut observer = BodyObserver::new();
+    let mut last_stance = [true; 4];
+
     // Tick the gait, map to Go2 order, compute optional support FF, and apply
     // the optional IMU body-leveling correction (drives measured roll/pitch
     // toward zero by trimming the stance feet — see `level_correction`).
     macro_rules! gait_qtau {
         () => {{
             let out = ctrl.tick(CONTROL_DT);
+            // Snapshot this tick's contact schedule for next tick's observer.
+            last_stance = [
+                out.legs[0].phase.is_stance,
+                out.legs[1].phase.is_stance,
+                out.legs[2].phase.is_stance,
+                out.legs[3].phase.is_stance,
+            ];
             let mut q = output_to_go2(&out, &signs)?;
             let tau = if ff {
                 support_tau_go2(&out, ctrl.kinematics(), &signs, weight, com_xy)
@@ -1125,6 +1300,8 @@ fn run_hardware(
                     st.imu_state.rpy[1] as f64,
                     st.imu_state.rpy[2] as f64,
                 ];
+                // Feed the MPC modes their closed-loop state (no-op otherwise).
+                observer.feed(&mut ctrl, st, &kin_obs, &signs, &last_stance, CONTROL_DT);
             }
             s
         }};
