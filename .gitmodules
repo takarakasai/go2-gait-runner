@@ -1,0 +1,3 @@
+[submodule "models/unitree_go2"]
+	path = models/unitree_go2
+	url = /home/takara/work/keel/unitree-go2-models
