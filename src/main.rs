@@ -189,7 +189,7 @@ struct Cli {
 /// Named flags that act as presence booleans (no value consumed).
 const BOOL_FLAGS: &[&str] = &[
     "ff", "grav-ff", "no-release", "restore", "smooth-swing", "level", "viz", "led-3support",
-    "step-noadvance",
+    "step-noadvance", "no-keyboard", "selftest",
 ];
 
 fn parse_cli(args: impl Iterator<Item = String>) -> Cli {
@@ -298,6 +298,48 @@ const STEP_FWD_MARGIN: f64 = 0.02;
 /// keeps consecutive lifts on opposite corners.
 const STEP_ORDER: [usize; 4] = [1, 2, 0, 3]; // FR, RL, FL, RR
 
+// ── RL policy deployment (`policy` subcommand) ──────────────────────────────
+// The policy is trained in Isaac Lab, whose 12 joints are grouped by TYPE
+// (all hips, all thighs, all calves) in the order FL,FR,RL,RR within each.
+// The Go2 SDK orders motors by LEG: FR(0..2) FL(3..5) RR(6..8) RL(9..11), each
+// (hip,thigh,calf). These two index tables convert between the conventions —
+// VERIFIED against the live articulation (see go2_rl/dump_joint_order.py).
+//
+//   Isaac idx: 0 FL_hip 1 FR_hip 2 RL_hip 3 RR_hip
+//              4 FL_thigh 5 FR_thigh 6 RL_thigh 7 RR_thigh
+//              8 FL_calf 9 FR_calf 10 RL_calf 11 RR_calf
+//
+/// All policy-deployment constants — only compiled with the `policy` feature.
+#[cfg(feature = "policy")]
+mod policy_cfg {
+    /// Go2 SDK motor index for each Isaac joint index (reorder a policy ACTION out).
+    pub const ISAAC_TO_GO2: [usize; 12] = [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8];
+    /// Isaac joint index for each Go2 SDK motor index (build the OBSERVATION from
+    /// measured state).
+    pub const GO2_TO_ISAAC: [usize; 12] = [1, 5, 9, 0, 4, 8, 3, 7, 11, 2, 6, 10];
+    /// Default joint positions in **Isaac order** (the policy's nominal pose). The
+    /// action is applied as q_des = default + ACTION_SCALE * action.
+    pub const DEFAULT_ISAAC: [f64; 12] = [
+        0.1, -0.1, 0.1, -0.1, // hips: FL,FR,RL,RR
+        0.8, 0.8, 1.0, 1.0, //   thighs: FL,FR,RL,RR
+        -1.5, -1.5, -1.5, -1.5, // calves
+    ];
+    /// Isaac Lab `JointPositionActionCfg` scale (use_default_offset=True).
+    pub const ACTION_SCALE: f64 = 0.5;
+    /// Policy inference rate: Isaac decimation 4 × sim dt 0.005 = 50 Hz, i.e. one
+    /// inference every 10 ticks of the 500 Hz control loop.
+    pub const POLICY_DECIMATION: u64 = 10;
+    /// On-board PD gains the policy was trained with (Go2 actuator cfg).
+    pub const POLICY_KP: f32 = 25.0;
+    pub const POLICY_KD: f32 = 0.5;
+    /// Crawl command ranges the policy was trained on (m/s, m/s, rad/s).
+    pub const CMD_VX_RANGE: (f64, f64) = (-0.3, 0.6);
+    pub const CMD_VY_RANGE: (f64, f64) = (-0.3, 0.3);
+    pub const CMD_WZ_RANGE: (f64, f64) = (-0.5, 0.5);
+}
+#[cfg(feature = "policy")]
+use policy_cfg::*;
+
 /// Full usage for every mode and flag (`-h` / `--help`).
 fn print_help() {
     eprint!(
@@ -313,6 +355,11 @@ MODES:
   run    <iface>  Hardware: release sport_mode -> ramp -> in-place -> forward
                   -> fold; reads state back and prints a tracking/tilt summary.
   diag   <iface>  Alias for `run` (identical behaviour).
+  policy <iface> --model P.onnx
+                  Hardware: run an exported RL policy (ONNX) instead of
+                  LinearCrawl. release -> stand to default -> 50 Hz inference
+                  (kp=25,kd=0.5) -> fold. WASD/arrows teleop (see below).
+                  --selftest loads+runs the model offline (no robot).
   release <iface> Deactivate sport_mode (native RPC; replaces go2_motion_ctrl).
   restore <iface> Re-select \"normal\" so the onboard controller takes over.
   checkmode <iface>  Print the currently active motion mode.
@@ -374,13 +421,26 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --viz-endpoint EP Zenoh listen endpoint (e.g. tcp/0.0.0.0:7447) for hosts
                     without multicast (same PC / WSL2); the viewer connects to
                     it. Default: auto multicast discovery (works on a LAN).
-  --no-release      do NOT auto-release sport_mode at startup   [run/diag]
-  --restore         re-activate sport_mode after the run        [run/diag]
+  --no-release      do NOT auto-release sport_mode at startup   [run/diag/policy]
+  --restore         re-activate sport_mode after the run        [run/diag/policy]
   -h, --help        show this help
+
+POLICY MODE FLAGS (`policy <iface>`):
+  --model PATH      exported policy ONNX (required); input obs[1,45], out [1,12]
+  --vx/--vy/--wz V  initial velocity command (m/s, m/s, rad/s); clamped to the
+                    crawl range vx[-0.3,0.6] vy[-0.3,0.3] wz[-0.5,0.5]
+  --kp K --kd K     PD gains (default kp=25 kd=0.5 — the trained gains)
+  --no-keyboard     disable WASD/arrow teleop; hold the initial command
+  --duration S      auto-stop and fold after S seconds (default: until quit)
+  --selftest        load + run the ONNX offline (no DDS/robot) and exit
+  Teleop keys: W/S or Up/Down = forward/back, A/D = strafe, Left/Right = turn,
+               Space = stop, q/Esc = quit & fold.
 
 EXAMPLE (validated on slippery flooring):
   go2-gait-runner run eth0 --vx 0.02 --cycle 2.5 --four-support 0.9 \\
       --swing 0.04 --kp 200 --kd 6 --ff
+  # learned crawl policy with keyboard teleop:
+  go2-gait-runner policy eth0 --model exported/policy.onnx
 "
     );
 }
@@ -567,6 +627,71 @@ fn main() {
             if cli.flag("restore") {
                 if let Err(e) = motion_restore(&iface) {
                     eprintln!("warning: failed to restore sport_mode: {e}");
+                }
+            }
+        }
+        "policy" => {
+            // `policy <iface> --model P.onnx [--vx V] [--vy V] [--wz V]
+            //   [--kp K] [--kd K] [--no-keyboard] [--duration S]
+            //   [--no-release] [--restore]`
+            // Run an exported RL policy (ONNX) instead of LinearCrawl. WASD +
+            // arrow keys teleop the velocity command unless --no-keyboard.
+            #[cfg(not(feature = "policy"))]
+            {
+                eprintln!(
+                    "error: this binary was built without the `policy` feature\n\
+                     rebuild with: cargo build --release --features policy"
+                );
+                std::process::exit(2);
+            }
+            #[cfg(feature = "policy")]
+            {
+                let iface = cli.positionals.get(1).cloned().unwrap_or_default();
+                let model = cli.str("model").unwrap_or_default().to_string();
+                if iface.is_empty() || model.is_empty() {
+                    eprintln!(
+                        "usage: go2-gait-runner policy <iface> --model P.onnx \
+                         [--vx V] [--vy V] [--wz V] [--kp K] [--kd K] \
+                         [--no-keyboard] [--duration S] [--no-release] [--restore]"
+                    );
+                    std::process::exit(2);
+                }
+                // `--selftest`: load the ONNX and run inference offline (no DDS,
+                // no robot) to validate the model before a hardware run.
+                if cli.flag("selftest") {
+                    if let Err(e) = policy_selftest(&model) {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                    return;
+                }
+                let vx0 = cli.f64("vx").unwrap_or(0.0);
+                let vy0 = cli.f64("vy").unwrap_or(0.0);
+                let wz0 = cli.f64("wz").unwrap_or(0.0);
+                let kp = cli.f32("kp").unwrap_or(POLICY_KP);
+                let kd = cli.f32("kd").unwrap_or(POLICY_KD);
+                let keyboard = !cli.flag("no-keyboard");
+                let duration = cli.f64("duration");
+
+                if !cli.flag("no-release") {
+                    if let Err(e) = motion_release(&iface) {
+                        eprintln!(
+                            "error: failed to release sport_mode: {e}\n\
+                             (pass --no-release if you released it some other way)"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                let res =
+                    run_policy(&iface, &model, [vx0, vy0, wz0], kp, kd, keyboard, duration);
+                if let Err(e) = res {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+                if cli.flag("restore") {
+                    if let Err(e) = motion_restore(&iface) {
+                        eprintln!("warning: failed to restore sport_mode: {e}");
+                    }
                 }
             }
         }
@@ -2241,5 +2366,370 @@ fn run_hardware(
     );
     eprintln!("  → minimise roll/pitch (sway) and |yaw drift| (off-axis) when tuning.");
     eprintln!("done: gait complete, folded on the ground.");
+    Ok(())
+}
+
+// ============================================================================
+// RL POLICY MODE (`policy` subcommand)
+// ============================================================================
+// Runs an exported Isaac Lab policy (ONNX, via the pure-Rust `tract` runtime)
+// in place of the LinearCrawl controller. Reuses the hardware glue (sport-mode
+// release in the dispatcher, DDS lowcmd path, fold-down). The policy is a small
+// MLP: 45-d proprioceptive obs -> 12 joint-position offsets. Inference at 50 Hz
+// (decimation 10 of the 500 Hz loop); the on-board PD (kp=25,kd=0.5) holds each
+// target. WASD/arrow keys teleop the velocity command.
+
+/// Clamp a [vx, vy, wz] command to the crawl ranges the policy was trained on.
+#[cfg(feature = "policy")]
+fn clamp_cmd(mut c: [f64; 3]) -> [f64; 3] {
+    c[0] = c[0].clamp(CMD_VX_RANGE.0, CMD_VX_RANGE.1);
+    c[1] = c[1].clamp(CMD_VY_RANGE.0, CMD_VY_RANGE.1);
+    c[2] = c[2].clamp(CMD_WZ_RANGE.0, CMD_WZ_RANGE.1);
+    c
+}
+
+/// Build the 45-d policy observation in **Isaac joint order** from a LowState.
+/// Layout (matches the trained obs group exactly, no scaling/normalization):
+///   base_ang_vel(3) · projected_gravity(3) · velocity_commands(3)
+///   · (joint_pos − default)(12) · joint_vel(12) · last_action(12)
+#[cfg(feature = "policy")]
+fn build_policy_obs(s: &LowState, cmd: &[f64; 3], last_action: &[f64; 12]) -> Vec<f32> {
+    let mut obs = Vec::with_capacity(45);
+    // base angular velocity (body frame) = IMU gyroscope
+    let g = &s.imu_state.gyroscope;
+    obs.push(g[0]);
+    obs.push(g[1]);
+    obs.push(g[2]);
+    // projected gravity (unit, body frame) from the orientation quaternion
+    // (w,x,y,z): gravity_b = R(q)^T · (0,0,-1) = -[third row of R].
+    let q = &s.imu_state.quaternion;
+    let (w, x, y, z) = (q[0] as f64, q[1] as f64, q[2] as f64, q[3] as f64);
+    let gx = 2.0 * (w * y - x * z);
+    let gy = -2.0 * (y * z + w * x);
+    let gz = 2.0 * (x * x + y * y) - 1.0;
+    obs.push(gx as f32);
+    obs.push(gy as f32);
+    obs.push(gz as f32);
+    // velocity command [vx, vy, wz]
+    obs.push(cmd[0] as f32);
+    obs.push(cmd[1] as f32);
+    obs.push(cmd[2] as f32);
+    // joint position (relative to default) and velocity, reordered to Isaac order
+    let mut jp = [0.0f32; 12];
+    let mut jv = [0.0f32; 12];
+    for gidx in 0..12 {
+        let iidx = GO2_TO_ISAAC[gidx];
+        jp[iidx] = s.motor_state[gidx].q - DEFAULT_ISAAC[iidx] as f32;
+        jv[iidx] = s.motor_state[gidx].dq;
+    }
+    obs.extend_from_slice(&jp);
+    obs.extend_from_slice(&jv);
+    for a in last_action.iter() {
+        obs.push(*a as f32);
+    }
+    obs
+}
+
+/// Spawn the WASD / arrow-key teleop thread. Enables terminal raw mode (restored
+/// when the thread exits). Mutates the shared command; sets `quit` on q/Esc/Ctrl-C.
+#[cfg(feature = "policy")]
+fn spawn_keyboard(
+    cmd: std::sync::Arc<std::sync::Mutex<[f64; 3]>>,
+    quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    use std::sync::atomic::Ordering;
+
+    enable_raw_mode().map_err(|e| format!("enable raw mode: {e}"))?;
+    eprintln!(
+        "policy: keyboard teleop — W/S or Up/Down = forward/back, A/D = strafe \
+         left/right,\r\n        Left/Right = turn, Space = stop, q/Esc = quit & fold.\r"
+    );
+    let h = std::thread::spawn(move || {
+        const DVX: f64 = 0.1;
+        const DVY: f64 = 0.1;
+        const DWZ: f64 = 0.1;
+        loop {
+            if quit.load(Ordering::Relaxed) {
+                break;
+            }
+            match event::poll(Duration::from_millis(100)) {
+                Ok(true) => {
+                    if let Ok(Event::Key(k)) = event::read() {
+                        let mut c = cmd.lock().unwrap();
+                        match k.code {
+                            KeyCode::Char('w') | KeyCode::Up => c[0] += DVX,
+                            KeyCode::Char('s') | KeyCode::Down => c[0] -= DVX,
+                            KeyCode::Char('a') => c[1] += DVY,
+                            KeyCode::Char('d') => c[1] -= DVY,
+                            KeyCode::Left => c[2] += DWZ,
+                            KeyCode::Right => c[2] -= DWZ,
+                            KeyCode::Char(' ') => *c = [0.0, 0.0, 0.0],
+                            KeyCode::Char('q') | KeyCode::Esc => quit.store(true, Ordering::Relaxed),
+                            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                                quit.store(true, Ordering::Relaxed)
+                            }
+                            _ => {}
+                        }
+                        *c = clamp_cmd(*c);
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+        let _ = disable_raw_mode();
+    });
+    Ok(h)
+}
+
+/// Offline model check (`policy ... --selftest`): load the ONNX in tract and run
+/// a few inferences without touching the robot. Validates the file loads, the
+/// 45->12 shape is right, and inference works on this build/arch.
+#[cfg(feature = "policy")]
+fn policy_selftest(model_path: &str) -> Result<(), String> {
+    use tract_onnx::prelude::*;
+    const N_OBS: usize = 45;
+    let model = tract_onnx::onnx()
+        .model_for_path(model_path)
+        .map_err(|e| format!("load onnx {model_path}: {e}"))?
+        .with_input_fact(0, f32::fact([1, N_OBS]).into())
+        .map_err(|e| format!("input fact: {e}"))?
+        .into_optimized()
+        .map_err(|e| format!("optimize: {e}"))?
+        .into_runnable()
+        .map_err(|e| format!("runnable: {e}"))?;
+    eprintln!("selftest: loaded {model_path} OK (obs={N_OBS})");
+    // zero observation
+    for (label, obs) in [
+        ("zeros", vec![0.0f32; N_OBS]),
+        ("ones", vec![1.0f32; N_OBS]),
+    ] {
+        let input: Tensor = tract_ndarray::Array2::<f32>::from_shape_vec((1, N_OBS), obs)
+            .map_err(|e| format!("obs shape: {e}"))?
+            .into();
+        let out = model
+            .run(tvec!(input.into()))
+            .map_err(|e| format!("inference: {e}"))?;
+        let view = out[0]
+            .to_array_view::<f32>()
+            .map_err(|e| format!("output view: {e}"))?;
+        if view.len() != 12 {
+            return Err(format!("expected 12 outputs, got {}", view.len()));
+        }
+        let a: Vec<f32> = view.iter().map(|v| (v * 1000.0).round() / 1000.0).collect();
+        eprintln!("selftest: action[{label}] = {a:?}");
+    }
+    eprintln!("selftest: OK — model loads and infers (45 -> 12).");
+    Ok(())
+}
+
+/// Run an exported RL policy on the robot. `init_cmd` = [vx, vy, wz] starting
+/// command; `keyboard` enables WASD/arrow teleop; `duration` = optional auto-stop.
+#[cfg(feature = "policy")]
+fn run_policy(
+    iface: &str,
+    model_path: &str,
+    init_cmd: [f64; 3],
+    kp: f32,
+    kd: f32,
+    keyboard: bool,
+    duration: Option<f64>,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tract_onnx::prelude::*;
+
+    const N_OBS: usize = 45;
+
+    // ── Load + optimize the ONNX policy ──────────────────────────────────────
+    let model = tract_onnx::onnx()
+        .model_for_path(model_path)
+        .map_err(|e| format!("load onnx {model_path}: {e}"))?
+        .with_input_fact(0, f32::fact([1, N_OBS]).into())
+        .map_err(|e| format!("input fact: {e}"))?
+        .into_optimized()
+        .map_err(|e| format!("optimize: {e}"))?
+        .into_runnable()
+        .map_err(|e| format!("runnable: {e}"))?;
+    eprintln!(
+        "policy: loaded {model_path} (obs={N_OBS}, kp={kp}, kd={kd}, \
+         decimation={POLICY_DECIMATION} -> {:.0} Hz inference)",
+        1.0 / (CONTROL_DT * POLICY_DECIMATION as f64)
+    );
+
+    // ── DDS participant / reader / writer (same as the gait path) ────────────
+    let dp = Participant::new(0, Some(iface)).map_err(|e| format!("participant: {e}"))?;
+    let cmd_topic = dp
+        .create_topic::<unitree_go2::LowCmd>(topics::LOW_CMD)
+        .map_err(|e| format!("cmd topic: {e}"))?;
+    let writer = dp
+        .create_writer(&cmd_topic, WriterQos::low_level_default())
+        .map_err(|e| format!("writer: {e}"))?;
+    let state_topic = dp
+        .create_topic::<LowState>(topics::LOW_STATE)
+        .map_err(|e| format!("state topic: {e}"))?;
+    let reader = dp
+        .create_reader(&state_topic, ReaderQos::low_level_default())
+        .map_err(|e| format!("reader: {e}"))?;
+
+    let start = wait_for_start_pose(&reader)?; // [f64;12] in Go2 motor order
+
+    // default pose in Go2 order
+    let mut default_go2 = [0.0f64; 12];
+    for i in 0..12 {
+        default_go2[ISAAC_TO_GO2[i]] = DEFAULT_ISAAC[i];
+    }
+
+    // shared command + quit flag, optional keyboard thread
+    let cmd = Arc::new(Mutex::new(clamp_cmd(init_cmd)));
+    let quit = Arc::new(AtomicBool::new(false));
+    let kb_handle = if keyboard {
+        Some(spawn_keyboard(cmd.clone(), quit.clone())?)
+    } else {
+        eprintln!(
+            "policy: keyboard disabled; holding vx={:.2} vy={:.2} wz={:.2}",
+            init_cmd[0], init_cmd[1], init_cmd[2]
+        );
+        None
+    };
+
+    // lowcmd + emit closure (position targets only; policy has no feedforward)
+    let mut lowcmd = init_lowcmd();
+    let loop_start = Instant::now();
+    let mut tick: u64 = 0;
+    let mut emit = |q: &[f64; 12], kpv: f32, kdv: f32| -> Result<(), String> {
+        for j in 0..joint::NUM_LEG_JOINTS {
+            let m = &mut lowcmd.motor_cmd[j];
+            m.q = q[j] as f32;
+            m.dq = 0.0;
+            m.kp = kpv;
+            m.kd = kdv;
+            m.tau = 0.0;
+        }
+        set_crc(&mut lowcmd);
+        writer.write(&lowcmd).map_err(|e| format!("write: {e}"))?;
+        tick += 1;
+        let next = loop_start + Duration::from_secs_f64(CONTROL_DT * tick as f64);
+        if let Some(d) = next.checked_duration_since(Instant::now()) {
+            std::thread::sleep(d);
+        }
+        Ok(())
+    };
+    let ticks = |secs: f64| -> u64 { (secs / CONTROL_DT).round().max(1.0) as u64 };
+
+    // ── Phase A: ramp from the measured start pose to the policy default ─────
+    eprintln!("policy: standing to default pose over {RAMP_SECS}s (kp ramped 0->{kp}) ...");
+    let ramp_n = ticks(RAMP_SECS);
+    for i in 0..ramp_n {
+        if quit.load(Ordering::Relaxed) {
+            break;
+        }
+        let p = i as f64 / ramp_n as f64;
+        let mut q = [0.0f64; 12];
+        for j in 0..12 {
+            q[j] = (1.0 - p) * start[j] + p * default_go2[j];
+        }
+        emit(&q, (kp as f64 * p) as f32, kd)?;
+    }
+    for _ in 0..ticks(0.5) {
+        if quit.load(Ordering::Relaxed) {
+            break;
+        }
+        emit(&default_go2, kp, kd)?;
+    }
+
+    // ── Phase B: policy loop (50 Hz inference, 500 Hz hold) ──────────────────
+    eprintln!("policy: RUNNING.");
+    let mut last_action = [0.0f64; 12]; // Isaac order
+    let mut q_des_go2 = default_go2;
+    // run-time deadline (the emit closure owns `tick`, so gate on elapsed time)
+    let deadline = duration.map(Duration::from_secs_f64);
+    let run_start = Instant::now();
+    let mut status = Instant::now();
+    'run: while !quit.load(Ordering::Relaxed) {
+        if let Some(d) = deadline {
+            if run_start.elapsed() >= d {
+                break;
+            }
+        }
+        // newest robot state -> obs -> inference -> joint targets
+        if let Some(st) = reader.poll().map_err(|e| format!("poll: {e}"))? {
+            let cmd_now = *cmd.lock().unwrap();
+            let obs = build_policy_obs(&st, &cmd_now, &last_action);
+            let input: Tensor = tract_ndarray::Array2::<f32>::from_shape_vec((1, N_OBS), obs)
+                .map_err(|e| format!("obs shape: {e}"))?
+                .into();
+            let out = model
+                .run(tvec!(input.into()))
+                .map_err(|e| format!("inference: {e}"))?;
+            let view = out[0]
+                .to_array_view::<f32>()
+                .map_err(|e| format!("output view: {e}"))?;
+            let mut action_isaac = [0.0f64; 12];
+            for i in 0..12 {
+                action_isaac[i] = view[[0, i]] as f64;
+            }
+            last_action = action_isaac;
+            // q_des = default + scale*action (Isaac), reorder to Go2, clamp to limits
+            for i in 0..12 {
+                let q_isaac = DEFAULT_ISAAC[i] + ACTION_SCALE * action_isaac[i];
+                let g = ISAAC_TO_GO2[i];
+                let (lo, hi) = LIMITS[g % 3];
+                q_des_go2[g] = q_isaac.clamp(lo, hi);
+            }
+            if status.elapsed().as_secs_f64() > 0.5 {
+                let rpy = st.imu_state.rpy;
+                eprint!(
+                    "\rpolicy: cmd vx={:+.2} vy={:+.2} wz={:+.2}  pitch={:+.1}deg roll={:+.1}deg   ",
+                    cmd_now[0],
+                    cmd_now[1],
+                    cmd_now[2],
+                    (rpy[1] as f64).to_degrees(),
+                    (rpy[0] as f64).to_degrees()
+                );
+                let _ = std::io::stderr().flush();
+                status = Instant::now();
+            }
+        }
+        // hold the target for POLICY_DECIMATION control ticks
+        for _ in 0..POLICY_DECIMATION {
+            if quit.load(Ordering::Relaxed) {
+                break 'run;
+            }
+            if let Some(d) = deadline {
+                if run_start.elapsed() >= d {
+                    break 'run;
+                }
+            }
+            emit(&q_des_go2, kp, kd)?;
+        }
+    }
+
+    // stop the keyboard thread (restores the terminal) before the fold prints
+    quit.store(true, Ordering::Relaxed);
+
+    // ── Phase D: fold to the lying pose ──────────────────────────────────────
+    eprintln!("\npolicy: folding to lying pose over {FOLD_SECS}s ...");
+    let cur = q_des_go2;
+    let fold_n = ticks(FOLD_SECS);
+    for i in 0..fold_n {
+        let p = i as f64 / fold_n as f64;
+        let mut q = [0.0f64; 12];
+        for j in 0..12 {
+            q[j] = (1.0 - p) * cur[j] + p * LIE_POS[j];
+        }
+        emit(&q, kp, kd)?;
+    }
+    for _ in 0..ticks(0.5) {
+        emit(&LIE_POS, kp, kd)?;
+    }
+
+    if let Some(h) = kb_handle {
+        let _ = h.join();
+    }
+    eprintln!("policy: done, folded on the ground.");
     Ok(())
 }

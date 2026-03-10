@@ -4,3 +4,12 @@
 # host aliases.
 [net]
 git-fetch-with-cli = true
+# Bake an rpath of `$ORIGIN` (the directory the binary lives in) so the runtime
+# loader finds `libddsc.so.0` next to the executable — no LD_LIBRARY_PATH needed.
+# `cyclonedds-sys` only links `libddsc` dynamically (no static .a is shipped), so
+# the .so must travel with the binary: copy it alongside after building, e.g.
+#   cp "$UNITREE_SDK2_ROOT/thirdparty/lib/$(uname -m)/libddsc.so.0" target/release/
+# cargo invokes the linker directly (no shell), so `$ORIGIN` reaches ld literally.
+[build]
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]
+

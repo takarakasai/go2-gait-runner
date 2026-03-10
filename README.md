@@ -71,3 +71,44 @@ go2-gait-runner --help
 # doesn't shake the body (0 disables the cap):
 go2-gait-runner run eth0 --vx 0.05 --four-support 0.9 --max-swing-speed 3.0
 ```
+
+## Learned-policy mode (`policy`)
+
+Built with the default `policy` feature, the `policy` subcommand runs an
+exported reinforcement-learning policy (ONNX, via the pure-Rust
+[`tract`](https://github.com/sonos/tract) runtime) in place of the analytic
+LinearCrawl controller. It reuses the same hardware glue (sport-mode release,
+500 Hz `rt/lowcmd`, fold-down on exit); only the joint-target source changes.
+
+```sh
+# WASD/arrow-key teleop of a learned crawl:
+go2-gait-runner policy eth0 --model exported/policy.onnx
+# validate the model offline first (no robot needed):
+go2-gait-runner policy x --model exported/policy.onnx --selftest
+```
+
+The policy is a small MLP exported from Isaac Lab. The runner reconstructs the
+exact training contract:
+
+- **Observation (45-d, proprioceptive)**, in Isaac joint order:
+  `base_ang_vel(3) · projected_gravity(3) · velocity_commands(3) ·
+  (joint_pos − default)(12) · joint_vel(12) · last_action(12)`. No scaling or
+  normalization (trained with `actor_obs_normalization=False`). `base_lin_vel`
+  is **deliberately absent** — it can't be measured cleanly under low-level
+  control, so the policy is trained without it.
+- **Action**: `q_des = default + 0.5 · action`, fed to the on-board PD at
+  **kp=25, kd=0.5** (the trained gains), at **50 Hz** (held across 10 of the
+  500 Hz ticks).
+- **Joint order**: Isaac groups joints by type (all hips, thighs, calves); the
+  Go2 SDK groups by leg (FR,FL,RR,RL). The conversion tables `ISAAC_TO_GO2` /
+  `GO2_TO_ISAAC` (in `main.rs`) are verified against the live articulation.
+
+Teleop: `W/S` or `↑/↓` forward/back, `A/D` strafe, `←/→` turn, `Space` stop,
+`q`/`Esc` quit & fold. Commands are clamped to the trained crawl range
+(vx ∈ [−0.3, 0.6], vy ∈ [±0.3], wz ∈ [±0.5]). `--no-keyboard` holds a fixed
+`--vx/--vy/--wz`; `--duration S` auto-folds after S seconds.
+
+> ⚠ **First hardware bring-up**: the Isaac (USD) joint *sign* convention is
+> assumed to match the Go2 SDK directly (no per-joint flip). Before a full run,
+> verify each joint moves in the expected direction at low `--kp` — a flipped
+> sign will destabilize the policy.

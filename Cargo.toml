@@ -25,10 +25,18 @@ nalgebra = "0.34.2"
 # `--no-default-features` to drop Zenoh + its runtime from the build.
 zenoh = { version = "1.9", optional = true }
 serde_json = { version = "1", optional = true }
+# Learned-policy mode (`policy` subcommand): run an exported RL policy (ONNX)
+# in place of the LinearCrawl controller. `tract-onnx` is a pure-Rust ONNX
+# runtime (no C deps — cross-compiles cleanly to the Go2's aarch64); `crossterm`
+# provides the non-blocking WASD / arrow-key teleop. Optional — drop with
+# `--no-default-features` (or `--no-default-features --features viz`).
+tract-onnx = { version = "0.21", optional = true }
+crossterm = { version = "0.27", optional = true }
 
 [features]
-default = ["viz"]
+default = ["viz", "policy"]
 viz = ["dep:zenoh", "dep:serde_json", "quadruped-gait/viz"]
+policy = ["dep:tract-onnx", "dep:crossterm"]
 
 # Own workspace root so cargo doesn't try to inherit a parent workspace.
 [workspace]
