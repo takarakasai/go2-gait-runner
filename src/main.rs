@@ -189,7 +189,7 @@ struct Cli {
 /// Named flags that act as presence booleans (no value consumed).
 const BOOL_FLAGS: &[&str] = &[
     "ff", "grav-ff", "no-release", "restore", "smooth-swing", "level", "viz", "led-3support",
-    "step-noadvance", "no-keyboard", "selftest",
+    "step-noadvance", "no-keyboard", "selftest", "hold",
 ];
 
 fn parse_cli(args: impl Iterator<Item = String>) -> Cli {
@@ -432,6 +432,8 @@ POLICY MODE FLAGS (`policy <iface>`):
   --kp K --kd K     PD gains (default kp=25 kd=0.5 — the trained gains)
   --no-keyboard     disable WASD/arrow teleop; hold the initial command
   --duration S      auto-stop and fold after S seconds (default: until quit)
+  --hold            bring-up: after standup, HOLD the default pose (no inference)
+                    and print the live observation, to verify obs signs by hand
   --selftest        load + run the ONNX offline (no DDS/robot) and exit
   Teleop keys: W/S or Up/Down = forward/back, A/D = strafe, Left/Right = turn,
                Space = stop, q/Esc = quit & fold.
@@ -672,6 +674,9 @@ fn main() {
                 let kd = cli.f32("kd").unwrap_or(POLICY_KD);
                 let keyboard = !cli.flag("no-keyboard");
                 let duration = cli.f64("duration");
+                // `--hold`: after standup, HOLD the default pose (no inference)
+                // and print the live observation, to verify obs signs by hand.
+                let hold = cli.flag("hold");
 
                 if !cli.flag("no-release") {
                     if let Err(e) = motion_release(&iface) {
@@ -683,7 +688,7 @@ fn main() {
                     }
                 }
                 let res =
-                    run_policy(&iface, &model, [vx0, vy0, wz0], kp, kd, keyboard, duration);
+                    run_policy(&iface, &model, [vx0, vy0, wz0], kp, kd, keyboard, duration, hold);
                 if let Err(e) = res {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -2536,6 +2541,7 @@ fn run_policy(
     kd: f32,
     keyboard: bool,
     duration: Option<f64>,
+    hold: bool,
 ) -> Result<(), String> {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2642,7 +2648,15 @@ fn run_policy(
     }
 
     // ── Phase B: policy loop (50 Hz inference, 500 Hz hold) ──────────────────
-    eprintln!("policy: RUNNING.");
+    if hold {
+        eprintln!(
+            "policy: --hold ON — NOT running the policy; holding the default pose \
+             and printing live obs.\r\n        Tilt the robot by hand and check the \
+             signs (level & still: gravity~[0,0,-1], gyro~0)."
+        );
+    } else {
+        eprintln!("policy: RUNNING.");
+    }
     let mut last_action = [0.0f64; 12]; // Isaac order
     let mut q_des_go2 = default_go2;
     // run-time deadline (the emit closure owns `tick`, so gate on elapsed time)
@@ -2659,39 +2673,56 @@ fn run_policy(
         if let Some(st) = reader.poll().map_err(|e| format!("poll: {e}"))? {
             let cmd_now = *cmd.lock().unwrap();
             let obs = build_policy_obs(&st, &cmd_now, &last_action);
-            let input: Tensor = tract_ndarray::Array2::<f32>::from_shape_vec((1, N_OBS), obs)
-                .map_err(|e| format!("obs shape: {e}"))?
-                .into();
-            let out = model
-                .run(tvec!(input.into()))
-                .map_err(|e| format!("inference: {e}"))?;
-            let view = out[0]
-                .to_array_view::<f32>()
-                .map_err(|e| format!("output view: {e}"))?;
-            let mut action_isaac = [0.0f64; 12];
-            for i in 0..12 {
-                action_isaac[i] = view[[0, i]] as f64;
-            }
-            last_action = action_isaac;
-            // q_des = default + scale*action (Isaac), reorder to Go2, clamp to limits
-            for i in 0..12 {
-                let q_isaac = DEFAULT_ISAAC[i] + ACTION_SCALE * action_isaac[i];
-                let g = ISAAC_TO_GO2[i];
-                let (lo, hi) = LIMITS[g % 3];
-                q_des_go2[g] = q_isaac.clamp(lo, hi);
-            }
-            if status.elapsed().as_secs_f64() > 0.5 {
-                let rpy = st.imu_state.rpy;
-                eprint!(
-                    "\rpolicy: cmd vx={:+.2} vy={:+.2} wz={:+.2}  pitch={:+.1}deg roll={:+.1}deg   ",
-                    cmd_now[0],
-                    cmd_now[1],
-                    cmd_now[2],
-                    (rpy[1] as f64).to_degrees(),
-                    (rpy[0] as f64).to_degrees()
-                );
-                let _ = std::io::stderr().flush();
-                status = Instant::now();
+            if hold {
+                // calibration: keep the default pose, just surface the obs so the
+                // operator can verify observation signs by tilting the robot.
+                q_des_go2 = default_go2;
+                if status.elapsed().as_secs_f64() > 0.3 {
+                    eprint!(
+                        "\rHOLD obs: ang_vel=[{:+.2},{:+.2},{:+.2}] \
+                         grav=[{:+.2},{:+.2},{:+.2}]  \
+                         FR(h,t,c)=[{:+.2},{:+.2},{:+.2}]   ",
+                        obs[0], obs[1], obs[2], obs[3], obs[4], obs[5],
+                        st.motor_state[0].q, st.motor_state[1].q, st.motor_state[2].q,
+                    );
+                    let _ = std::io::stderr().flush();
+                    status = Instant::now();
+                }
+            } else {
+                let input: Tensor = tract_ndarray::Array2::<f32>::from_shape_vec((1, N_OBS), obs)
+                    .map_err(|e| format!("obs shape: {e}"))?
+                    .into();
+                let out = model
+                    .run(tvec!(input.into()))
+                    .map_err(|e| format!("inference: {e}"))?;
+                let view = out[0]
+                    .to_array_view::<f32>()
+                    .map_err(|e| format!("output view: {e}"))?;
+                let mut action_isaac = [0.0f64; 12];
+                for i in 0..12 {
+                    action_isaac[i] = view[[0, i]] as f64;
+                }
+                last_action = action_isaac;
+                // q_des = default + scale*action (Isaac), reorder to Go2, clamp to limits
+                for i in 0..12 {
+                    let q_isaac = DEFAULT_ISAAC[i] + ACTION_SCALE * action_isaac[i];
+                    let g = ISAAC_TO_GO2[i];
+                    let (lo, hi) = LIMITS[g % 3];
+                    q_des_go2[g] = q_isaac.clamp(lo, hi);
+                }
+                if status.elapsed().as_secs_f64() > 0.5 {
+                    let rpy = st.imu_state.rpy;
+                    eprint!(
+                        "\rpolicy: cmd vx={:+.2} vy={:+.2} wz={:+.2}  pitch={:+.1}deg roll={:+.1}deg   ",
+                        cmd_now[0],
+                        cmd_now[1],
+                        cmd_now[2],
+                        (rpy[1] as f64).to_degrees(),
+                        (rpy[0] as f64).to_degrees()
+                    );
+                    let _ = std::io::stderr().flush();
+                    status = Instant::now();
+                }
             }
         }
         // hold the target for POLICY_DECIMATION control ticks
