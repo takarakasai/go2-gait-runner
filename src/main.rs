@@ -339,8 +339,13 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
                     0 = disable = legacy unbounded). Slowing --cycle does NOT help.
   --led-3support    light the head LED during the 3-leg support period (and the
                     --led-margin window before/after it)            [run/diag]
-  --led-margin S    seconds before/after the 3-support period to keep the LED
-                    lit (default 0.1)                               [run/diag]
+  --led-margin S    swing lead, s: switch the indicator this long before each
+                    swing (default 0.1). No trailing hold — base resumes the
+                    instant the swing ends.
+  --led-color C     active (swing) colour via vui api 1007: white|red|yellow|
+                    blue|green|cyan|purple. Enables colour mode    [run/diag]
+  --led-base-color C  colour shown between swings in colour mode (default
+                    green; SetBrightness can't blank a coloured LED) [run/diag]
   --level           active IMU body-leveling: trim stance feet to hold trunk flat
   --level-gain G    leveling strength, signed (default 0.3; negate if it worsens)
   --ff              enable body-weight support feedforward      [run/diag]
@@ -473,7 +478,31 @@ fn main() {
             // Head-LED 3-support indicator: light the LED during the 3-leg
             // support period and `--led-margin` seconds before/after it.
             let led_3support = cli.flag("led-3support");
+            // Lead time before each swing (s): the indicator switches active
+            // this long before a swing opens. No trailing hold — base resumes
+            // the instant the swing ends.
             let led_margin = cli.f64("led-margin").unwrap_or(0.1);
+            // `--led-color <name>` tints the active (swing) state via vui api
+            // 1007 instead of the default white-brightness blink. `--led-base-color`
+            // is the colour shown *between* swings (SetBrightness can't blank a
+            // coloured LED, so the "off" state is itself a colour; default green).
+            // Validate up-front so a typo fails before the gait runs.
+            let validate_color = |key: &str| -> Option<String> {
+                match cli.str(key) {
+                    Some(c) if VUI_LED_COLORS.contains(&c) => Some(c.to_string()),
+                    Some(c) => {
+                        eprintln!("error: --{key} must be one of {VUI_LED_COLORS:?} (got {c:?})");
+                        std::process::exit(2);
+                    }
+                    None => None,
+                }
+            };
+            let led_color = validate_color("led-color");
+            let led_base_color = if led_color.is_some() {
+                Some(validate_color("led-base-color").unwrap_or_else(|| "green".to_string()))
+            } else {
+                None
+            };
             let viz_cfg = VizCfg {
                 enabled: cli.flag("viz"),
                 key: cli
@@ -502,7 +531,8 @@ fn main() {
             // and print the tracking/tilt summary. `diag` is kept as an alias.
             let res = run_hardware(
                 &iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale, level_gain, csv,
-                &viz_cfg, led_3support, led_margin,
+                &viz_cfg, led_3support, led_margin, led_color.as_deref(),
+                led_base_color.as_deref(),
             );
             if let Err(e) = res {
                 eprintln!("error: {e}");
@@ -661,6 +691,12 @@ const VUI_API_ID_SET_LED_COLOR: i64 = 1007;
 /// LED is not addressable RGB — only these named colours work; arbitrary
 /// r/g/b is not supported by the robot.
 const VUI_LED_COLORS: [&str; 7] = ["white", "red", "yellow", "blue", "green", "cyan", "purple"];
+
+/// `time` (s) for each SetLedColor (api 1007) call from the 3-support indicator
+/// (`--led-color`). The colour is a timed effect that lapses to white, so the
+/// LED thread re-asserts the current colour every `HOLD/2` s (and on every
+/// change); the hold just needs to exceed that refresh interval.
+const LED_COLOR_HOLD_SECS: u32 = 5;
 
 /// Head-LED control via the VUI service. `mode` is `on`/`off` (switch, api 1001,
 /// `{"enable":0|1}`) or a `0..=10` brightness level (api 1005,
@@ -1417,6 +1453,8 @@ fn run_hardware(
     viz_cfg: &VizCfg,
     led_3support: bool,
     led_margin: f64,
+    led_color: Option<&str>,
+    led_base_color: Option<&str>,
 ) -> Result<(), String> {
     use std::io::Write as _;
     let swing_h = tune.swing_h;
@@ -1462,6 +1500,14 @@ fn run_hardware(
     let (led_tx, led_handle) = if led_3support {
         let (tx, rx) = std::sync::mpsc::channel::<i32>();
         let iface_led = iface.to_string();
+        // Colour mode (`--led-color`): the swing window shows the active colour
+        // and the gaps show the base colour, both via SetLedColor (api 1007).
+        // SetBrightness can't blank a coloured LED (it resets it to white), so
+        // there is no dark "off" — the two states are two colours. SetLedColor
+        // is a *timed* effect that lapses to white, so the current colour is
+        // re-asserted both on every change and periodically (recv_timeout).
+        let active = led_color.map(|s| s.to_string());
+        let base = led_base_color.map(|s| s.to_string());
         let h = std::thread::spawn(move || {
             let rpc = match unitree_rpc::RpcClient::new(VUI_SERVICE, &iface_led) {
                 Ok(r) => r,
@@ -1471,46 +1517,96 @@ fn run_hardware(
                 }
             };
             let _ = rpc.call(VUI_API_ID_SET_SWITCH, "{\"enable\":1}"); // LED switch on
-            let _ = rpc.call(VUI_API_ID_SET_BRIGHTNESS, "{\"brightness\":0}"); // start dark
-            let mut last = 0i32;
-            // Block for the next target; coalesce to the newest so a burst of
-            // changes collapses to one RPC.
-            while let Ok(first) = rx.recv() {
-                let mut level = first;
-                while let Ok(l) = rx.try_recv() {
-                    level = l;
+            let set_color = |c: &str| {
+                let _ = rpc.call(
+                    VUI_API_ID_SET_LED_COLOR,
+                    &format!("{{\"color\":\"{c}\",\"time\":{LED_COLOR_HOLD_SECS}}}"),
+                );
+            };
+            match (active.as_deref(), base.as_deref()) {
+                // ── Colour mode: active colour ⇄ base colour ──────────────
+                (Some(act), Some(bas)) => {
+                    use std::sync::mpsc::RecvTimeoutError;
+                    // Refresh well within the colour's hold so it never lapses
+                    // to white between edges (e.g. a long gap with no swing).
+                    let refresh =
+                        std::time::Duration::from_secs_f64(LED_COLOR_HOLD_SECS as f64 / 2.0);
+                    let mut cur = bas.to_string();
+                    set_color(&cur); // start on the base colour
+                    let mut last = 0i32;
+                    loop {
+                        match rx.recv_timeout(refresh) {
+                            // Process every edge in order — do NOT coalesce.
+                            // Collapsing a blue→green pair (both queued while a
+                            // slow VUI RPC was in flight) to just green would
+                            // skip that swing's blue entirely — the reported
+                            // "sometimes stays green" bug. Edges are at most a
+                            // few per gait cycle, so one RPC each keeps up.
+                            Ok(level) => {
+                                if level != last {
+                                    cur = (if level > 0 { act } else { bas }).to_string();
+                                    set_color(&cur);
+                                    last = level;
+                                }
+                            }
+                            Err(RecvTimeoutError::Timeout) => set_color(&cur),
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                    let _ = rpc.call(VUI_API_ID_SET_SWITCH, "{\"enable\":0}"); // LED off on exit
                 }
-                if level != last {
-                    let _ = rpc.call(VUI_API_ID_SET_BRIGHTNESS, &format!("{{\"brightness\":{level}}}"));
-                    last = level;
+                // ── White mode: plain brightness blink (unchanged) ────────
+                _ => {
+                    let _ = rpc.call(VUI_API_ID_SET_BRIGHTNESS, "{\"brightness\":0}"); // start dark
+                    let mut last = 0i32;
+                    while let Ok(first) = rx.recv() {
+                        let mut level = first;
+                        while let Ok(l) = rx.try_recv() {
+                            level = l;
+                        }
+                        if level != last {
+                            let _ = rpc.call(
+                                VUI_API_ID_SET_BRIGHTNESS,
+                                &format!("{{\"brightness\":{level}}}"),
+                            );
+                            last = level;
+                        }
+                    }
+                    let _ = rpc.call(VUI_API_ID_SET_BRIGHTNESS, "{\"brightness\":0}"); // off on exit
                 }
             }
-            let _ = rpc.call(VUI_API_ID_SET_BRIGHTNESS, "{\"brightness\":0}"); // off on exit
         });
-        eprintln!("led: 3-support indicator ON (margin {led_margin:.3}s; brightness 10/0 via vui)");
+        match (led_color, led_base_color) {
+            (Some(act), Some(bas)) => eprintln!(
+                "led: 3-support indicator ON (active {act} ⇄ base {bas} via vui api 1007)"
+            ),
+            _ => eprintln!("led: 3-support indicator ON (brightness 10/0 via vui)"),
+        }
         (Some(tx), Some(h))
     } else {
         (None, None)
     };
-    // Preview controller, advanced `led_margin` ahead of the real gait, so the
-    // LED can be lit *before* a 3-support period begins. The gait is
+    // Lead time before a swing: the indicator turns active this many ticks
+    // *before* a 3-support window opens (`--led-margin`, default 0.1 s). There
+    // is no trailing hold — it returns to base the instant the swing ends.
+    let led_lead_ticks = (led_margin / CONTROL_DT).round().max(0.0) as u32;
+    // Preview controller, advanced `led_lead_ticks` ahead of the real gait, so
+    // the LED can switch *before* a 3-support period begins. The gait is
     // deterministic, so a shadow copy ticked ahead yields the upcoming contact
     // schedule. Contact *timing* is governed by the gait clock (independent of
     // velocity magnitude), so a fixed vx=0 preview gives the right timing.
-    let led_margin_ticks = (led_margin / CONTROL_DT).round().max(0.0) as u32;
     let mut led_preview = if led_3support {
         let (_m, _hq, mut pc, _s) = build_gait(misa_path, tune)?;
         pc.reset();
         pc.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
-        for _ in 0..led_margin_ticks {
+        for _ in 0..led_lead_ticks {
             pc.tick(CONTROL_DT);
         }
         Some(pc)
     } else {
         None
     };
-    let mut led_hold = 0u32; // ticks remaining of the post (直後) margin
-    let mut led_prev = -1i32; // last brightness sent (force first send)
+    let mut led_prev = -1i32; // last level sent (force first send)
 
     let mut cmd = init_lowcmd();
     let loop_start = Instant::now();
@@ -1784,20 +1880,14 @@ fn run_hardware(
                 }
             }
             // Head-LED 3-support indicator. `now` is this tick's support count;
-            // `fut` is the preview (led_margin ahead) → lights *before* a
-            // 3-support starts. A hold timer keeps it on `led_margin` *after* it
-            // ends. Only a changed brightness is sent (the thread does the RPC).
+            // `fut` is the preview (led_lead_ticks ahead) → switches *before* a
+            // 3-support starts. No trailing hold: it returns to base the instant
+            // the swing ends. Only a changed level is sent (the thread RPCs it).
             if let Some(pc) = led_preview.as_mut() {
                 let pv = pc.tick(CONTROL_DT);
                 let fut = pv.legs.iter().filter(|l| l.phase.is_stance).count();
                 let now = last_stance.iter().filter(|&&s| s).count();
-                let trigger = now == 3 || fut == 3;
-                if trigger {
-                    led_hold = led_margin_ticks;
-                } else if led_hold > 0 {
-                    led_hold -= 1;
-                }
-                let want = if trigger || led_hold > 0 { 10 } else { 0 };
+                let want = if now == 3 || fut == 3 { 10 } else { 0 };
                 if want != led_prev {
                     if let Some(tx) = led_tx.as_ref() {
                         let _ = tx.send(want);
