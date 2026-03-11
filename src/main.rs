@@ -1517,11 +1517,23 @@ fn run_hardware(
                 }
             };
             let _ = rpc.call(VUI_API_ID_SET_SWITCH, "{\"enable\":1}"); // LED switch on
+            // `GO2_LED_DEBUG=1` logs each colour RPC with its result and round-
+            // trip latency, to diagnose whether a "stayed green" swing is a
+            // dropped/slow/failed SetLedColor rather than a missed edge.
+            let debug = std::env::var_os("GO2_LED_DEBUG").is_some();
             let set_color = |c: &str| {
-                let _ = rpc.call(
+                let t = std::time::Instant::now();
+                let r = rpc.call(
                     VUI_API_ID_SET_LED_COLOR,
                     &format!("{{\"color\":\"{c}\",\"time\":{LED_COLOR_HOLD_SECS}}}"),
                 );
+                if debug {
+                    let ms = t.elapsed().as_millis();
+                    match &r {
+                        Ok(_) => eprintln!("led: -> {c} ok ({ms} ms)"),
+                        Err(e) => eprintln!("led: -> {c} ERR {e} ({ms} ms)"),
+                    }
+                }
             };
             match (active.as_deref(), base.as_deref()) {
                 // ── Colour mode: active colour ⇄ base colour ──────────────
