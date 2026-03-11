@@ -309,7 +309,10 @@ MODES:
                   util lidar <on|off> <iface>  toggle the L1 LiDAR
                   (publishes ON/OFF to rt/utlidar/switch).
                   util led <on|off|0..10> <iface>  head LED: on/off switch or
-                  brightness 0..10 (vui service; white only, no colour).
+                  brightness 0..10 (vui service, white).
+                  util led-color <white|red|yellow|blue|green|cyan|purple>
+                  <iface> [secs] [flash_ms]  head LED colour (vui api 1007;
+                  named palette only, no arbitrary RGB; secs default 5).
 
 FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --misa PATH       model .misa file        (default models/unitree_go2/go2.misa)
@@ -597,8 +600,37 @@ fn run_util(cli: &Cli) -> Result<(), String> {
             }
             util_led(&iface, mode)
         }
-        "" => Err("usage: go2-gait-runner util <cmd> <mode> <iface>   (cmd: lidar|led)".into()),
-        other => Err(format!("unknown util cmd {other:?} (supported: lidar, led)")),
+        "led-color" | "led-colour" => {
+            // `util led-color <color> <iface> [secs] [flash_ms]`: set the head
+            // LED to a named palette colour via VUI api 1007 (`mode` carries the
+            // colour). Optional positionals: hold duration (default 5 s) and a
+            // flash cycle in ms.
+            const USAGE: &str =
+                "usage: go2-gait-runner util led-color <white|red|yellow|blue|green|cyan|purple> <iface> [secs] [flash_ms]";
+            if mode.is_empty() {
+                return Err(USAGE.into());
+            }
+            let iface = cli.positionals.get(3).cloned().unwrap_or_default();
+            if iface.is_empty() {
+                return Err(USAGE.into());
+            }
+            let secs = match cli.positionals.get(4) {
+                Some(s) => s
+                    .parse()
+                    .map_err(|_| format!("secs must be a positive integer (got {s:?})"))?,
+                None => 5,
+            };
+            let flash = match cli.positionals.get(5) {
+                Some(s) => Some(
+                    s.parse()
+                        .map_err(|_| format!("flash_ms must be an integer (got {s:?})"))?,
+                ),
+                None => None,
+            };
+            util_led_color(&iface, mode, secs, flash)
+        }
+        "" => Err("usage: go2-gait-runner util <cmd> <mode> <iface>   (cmd: lidar|led|led-color)".into()),
+        other => Err(format!("unknown util cmd {other:?} (supported: lidar, led, led-color)")),
     }
 }
 
@@ -616,10 +648,19 @@ fn util_lidar(iface: &str, on: bool) -> Result<(), String> {
 
 /// Go2 VUI service (`rt/api/vui/request`) — same RPC envelope as the
 /// motion_switcher used for sport_mode. Drives the head LED (brightness /
-/// switch). API ids verified against `unitree_sdk2`'s `vui_api.hpp`.
+/// switch / colour). 1001/1005 are verified against `unitree_sdk2`'s
+/// `vui_api.hpp`; 1007 (SetLedColor) is an undocumented firmware api absent
+/// from that header — same `vui` service and `{api_id, parameter}` envelope,
+/// confirmed against the WebRTC community driver (go2_webrtc_connect).
 const VUI_SERVICE: &str = "vui";
 const VUI_API_ID_SET_SWITCH: i64 = 1001;
 const VUI_API_ID_SET_BRIGHTNESS: i64 = 1005;
+const VUI_API_ID_SET_LED_COLOR: i64 = 1007;
+
+/// Fixed colour palette the VUI SetLedColor (1007) firmware accepts. The head
+/// LED is not addressable RGB — only these named colours work; arbitrary
+/// r/g/b is not supported by the robot.
+const VUI_LED_COLORS: [&str; 7] = ["white", "red", "yellow", "blue", "green", "cyan", "purple"];
 
 /// Head-LED control via the VUI service. `mode` is `on`/`off` (switch, api 1001,
 /// `{"enable":0|1}`) or a `0..=10` brightness level (api 1005,
@@ -647,6 +688,44 @@ fn util_led(iface: &str, mode: &str) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
             eprintln!("head LED brightness = {level}/10 (vui SetBrightness)");
         }
+    }
+    Ok(())
+}
+
+/// Head-LED colour via the VUI service (api 1007, `SetLedColor`). `color` must
+/// be one of [`VUI_LED_COLORS`] (the firmware accepts only this named palette —
+/// no arbitrary RGB). `secs` is how long the colour holds before the robot
+/// reverts to its default; `flash` (ms) makes it blink — the firmware accepts a
+/// cycle of `499..=secs*1000`, `None` keeps it solid.
+fn util_led_color(iface: &str, color: &str, secs: u32, flash: Option<u32>) -> Result<(), String> {
+    if !VUI_LED_COLORS.contains(&color) {
+        return Err(format!(
+            "led colour must be one of {VUI_LED_COLORS:?} (got {color:?})"
+        ));
+    }
+    if secs == 0 {
+        return Err("led colour duration (secs) must be >= 1".into());
+    }
+    let param = match flash {
+        Some(ms) => {
+            let max = secs * 1000;
+            if !(499..=max).contains(&ms) {
+                return Err(format!(
+                    "led flash cycle must be 499..={max} ms for a {secs}s hold (got {ms})"
+                ));
+            }
+            format!("{{\"color\":\"{color}\",\"time\":{secs},\"flash_cycle\":{ms}}}")
+        }
+        None => format!("{{\"color\":\"{color}\",\"time\":{secs}}}"),
+    };
+    let rpc = unitree_rpc::RpcClient::new(VUI_SERVICE, iface).map_err(|e| e.to_string())?;
+    rpc.call(VUI_API_ID_SET_LED_COLOR, &param)
+        .map_err(|e| e.to_string())?;
+    match flash {
+        Some(ms) => eprintln!(
+            "head LED colour = {color} for {secs}s, flashing every {ms}ms (vui SetLedColor, api 1007)"
+        ),
+        None => eprintln!("head LED colour = {color} for {secs}s (vui SetLedColor, api 1007)"),
     }
     Ok(())
 }
