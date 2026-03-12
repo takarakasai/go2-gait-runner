@@ -1,10 +1,11 @@
 # Self-contained: dependencies are fetched from GitHub, no sibling checkout
-# required. `quadruped-gait` and `misarta` come from the `articara` repo
-# (same git source so their shared `misarta` type unifies — `quadruped-gait`
-# uses `misarta` internally, which is articara's submodule); the Unitree SDK
-# comes from `unitree-sdk-rs`. Fetching uses the system git (see
-# `.cargo/config.toml`) so the `github.com-takarakasai` SSH host alias and
-# the misarta submodule resolve.
+# required. `quadruped-gait` comes from the `articara` repo; `misarta` is its
+# own standalone repo (https://github.com/takarakasai/misarta.git) — the same
+# git source `quadruped-gait` and `articara` use, so the shared `misarta` type
+# unifies (cargo identifies a git source by its literal URL, so the `https://`
+# form must match theirs exactly). The Unitree SDK comes from `unitree-sdk-rs`.
+# Fetching uses the system git (see `.cargo/config.toml`) so the
+# `github.com-takarakasai` SSH host alias resolves.
 [package]
 name = "go2-gait-runner"
 version = "0.1.0"
@@ -15,7 +16,7 @@ description = "Headless CLI to run articara/quadruped-gait controllers on a real
 
 [dependencies]
 quadruped-gait = { git = "ssh://git@github.com/takarakasai/articara.git", package = "quadruped-gait" }
-misarta = { git = "ssh://git@github.com/takarakasai/articara.git", package = "misarta" }
+misarta = { git = "https://github.com/takarakasai/misarta.git" }
 unitree-go2 = { git = "ssh://git@github.com/takarakasai/unitree-sdk-rs.git", package = "unitree-go2" }
 unitree-rpc = { git = "ssh://git@github.com/takarakasai/unitree-sdk-rs.git", package = "unitree-rpc" }
 nalgebra = "0.34.2"
