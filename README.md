@@ -14,24 +14,20 @@ release, body-weight feedforward, telemetry).
 Self-contained: cargo fetches the dependencies from GitHub — no sibling
 checkout needed.
 
-- `quadruped-gait` + `misarta` from the `articara` repo (same git source,
-  so the `misarta` type shared with `quadruped-gait` unifies; `misarta` is
-  articara's submodule).
+- `quadruped-gait` from the `articara` repo.
+- `misarta` from its own standalone repo (`github.com/takarakasai/misarta`) —
+  the same git source `quadruped-gait` and `articara` use, so the shared
+  `misarta` type unifies.
 - `unitree-go2` + `unitree-rpc` from `unitree-sdk-rs`.
 
-These are private repos fetched over SSH using the `github.com-takarakasai`
-host alias (see your `~/.ssh/config`). [`.cargo/config.toml`](.cargo/config.toml)
-sets `net.git-fetch-with-cli = true` so the system git resolves that alias
-and the misarta submodule (libgit2 cannot). Make sure SSH access works:
-
-```sh
-ssh -T git@github.com-takarakasai      # should greet you as takarakasai
-```
+These are fetched over HTTPS from GitHub. [`.cargo/config.toml`](.cargo/config.toml)
+sets `net.git-fetch-with-cli = true` so the system git (and your configured
+credential helper, for private repos) handles the fetch.
 
 ## Build
 
 ```sh
-git clone ssh://git@github.com-takarakasai/takarakasai/go2-gait-runner.git
+git clone https://github.com/takarakasai/go2-gait-runner.git
 cd go2-gait-runner
 # Point cyclonedds-sys at a CycloneDDS install for your arch (the FFI
 # bindings are committed for x86_64 + aarch64; only the .so is resolved
@@ -54,9 +50,11 @@ against local, not-yet-pushed changes, add a path override in
 `.cargo/config.toml` (do not commit) — for example:
 
 ```toml
-[patch."ssh://git@github.com-takarakasai/takarakasai/articara.git"]
+[patch."https://github.com/takarakasai/articara.git"]
 quadruped-gait = { path = "../articara/quadruped-gait" }
-misarta = { path = "../articara/misarta" }
+
+[patch."https://github.com/takarakasai/misarta.git"]
+misarta = { path = "../misarta" }
 ```
 
 ## Usage
