@@ -1334,6 +1334,69 @@ fn wait_for_start_pose(reader: &unitree_go2::Reader<LowState>) -> Result<[f64; 1
     }
 }
 
+/// Squared L2 distance between two Go2 motor-order joint vectors.
+#[inline]
+fn qdist2(a: &[f64; 12], b: &[f64; 12]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..12 {
+        let d = a[i] - b[i];
+        s += d * d;
+    }
+    s
+}
+
+/// Choose a gait-cycle index whose all-stance posture is closest to the
+/// measured start pose, so the startup ramp doesn't drag feet just to enter the
+/// gait's internal phase geometry.
+fn pick_start_alignment(
+    misa_path: &str,
+    tune: GaitTune,
+    signs: &[[f64; 3]; 4],
+    start_q: &[f64; 12],
+    vx_target: f64,
+) -> Result<Option<(u64, [f64; 12], f64)>, String> {
+    if vx_target <= 0.0 {
+        return Ok(None);
+    }
+    let (_m, _hq, mut probe, _sgn) = build_gait(misa_path, tune)?;
+    // Advance with the actual run speed so the chosen phase matches the run.
+    probe.set_velocity_cmd(VelocityCmd {
+        vx: vx_target,
+        vy: 0.0,
+        wz: 0.0,
+    });
+    let cycle = probe.config().cycle_period_s.max(0.05);
+    // Scan a little over two cycles; this rides over soft-start and catches
+    // multiple all-stance windows.
+    let horizon = ((2.2 * cycle) / CONTROL_DT).round().max(1.0) as u64;
+
+    let mut best_tick = 0u64;
+    let mut best_q = [0.0; 12];
+    let mut best_cost = f64::INFINITY;
+    let mut found = false;
+
+    for i in 0..horizon {
+        let out = probe.tick(CONTROL_DT);
+        if !out.legs.iter().all(|l| l.phase.is_stance) {
+            continue;
+        }
+        let q = output_to_go2(&out, signs)?;
+        let c = qdist2(&q, start_q);
+        if c < best_cost {
+            best_cost = c;
+            best_tick = i;
+            best_q = q;
+            found = true;
+        }
+    }
+
+    if found {
+        Ok(Some((best_tick, best_q, best_cost.sqrt())))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Drive the LinearCrawl gait on the real robot via rt/lowcmd at 500 Hz, while
 /// reading state back from `rt/lowstate`.
 ///
@@ -1462,8 +1525,12 @@ fn run_hardware(
     let weight = body_weight_n(&model) * ff_scale;
     let com = misarta::centroidal::compute_com(&model, &home_q);
     let com_xy = (com.x, com.y);
-    ctrl.set_velocity_cmd(VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
-    let stance = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
+    ctrl.set_velocity_cmd(VelocityCmd {
+        vx: 0.0,
+        vy: 0.0,
+        wz: 0.0,
+    });
+    let mut stance = output_to_go2(&ctrl.tick(CONTROL_DT), &signs)?;
     ctrl.reset();
 
     eprintln!(
@@ -1487,6 +1554,40 @@ fn run_hardware(
         .map_err(|e| format!("reader: {e}"))?;
 
     let start = wait_for_start_pose(&reader)?;
+
+    // Startup phase alignment: select the closest all-stance gait posture to
+    // the measured start joint pose, then ramp toward that pose. This avoids
+    // an initial foot drag caused by forcing the robot into a fixed cycle phase
+    // that may be far from where the feet currently are.
+    if vx_target > 0.0 {
+        if let Some((best_tick, best_q, rms)) =
+            pick_start_alignment(misa_path, tune, &signs, &start, vx_target)?
+        {
+            stance = best_q;
+            // Reproduce the aligned internal phase in the live controller so
+            // Phase C continues from the same cycle state we aligned to.
+            ctrl.reset();
+            ctrl.set_velocity_cmd(VelocityCmd {
+                vx: vx_target,
+                vy: 0.0,
+                wz: 0.0,
+            });
+            for _ in 0..=best_tick {
+                let _ = ctrl.tick(CONTROL_DT);
+            }
+            // Freeze on this all-stance phase until forward motion starts.
+            ctrl.set_velocity_cmd(VelocityCmd {
+                vx: 0.0,
+                vy: 0.0,
+                wz: 0.0,
+            });
+            let _ = ctrl.tick(CONTROL_DT);
+            eprintln!(
+                "startup-align: selected all-stance phase tick={} (joint RMS {:.4} rad)",
+                best_tick, rms
+            );
+        }
+    }
 
     // ── Head-LED 3-support indicator (`--led-3support`) ──────────────
     // The LED is driven over the VUI service, whose RPC is request/response
