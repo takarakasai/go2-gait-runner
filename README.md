@@ -24,11 +24,17 @@ These are fetched over HTTPS from GitHub. [`.cargo/config.toml`](.cargo/config.t
 sets `net.git-fetch-with-cli = true` so the system git (and your configured
 credential helper, for private repos) handles the fetch.
 
+The Go2 model itself (`go2.misa`, loaded at run time) is **not** a cargo
+dependency — it lives in the `models/unitree_go2` git submodule, so clone with
+`--recurse-submodules` (see Build). Override the path with `--misa PATH`.
+
 ## Build
 
 ```sh
-git clone https://github.com/takarakasai/go2-gait-runner.git
+git clone --recurse-submodules https://github.com/takarakasai/go2-gait-runner.git
 cd go2-gait-runner
+# (already cloned without --recurse-submodules? fetch the Go2 model submodule:)
+#   git submodule update --init models/unitree_go2
 # Point cyclonedds-sys at a CycloneDDS install for your arch (the FFI
 # bindings are committed for x86_64 + aarch64; only the .so is resolved
 # here). The Unitree SDK2's bundled thirdparty libs work:
