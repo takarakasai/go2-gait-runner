@@ -289,6 +289,9 @@ const FOLD_SECS: f64 = 2.0;
 /// Startup gait-alignment (Phase A2): per-leg seconds to swing the lifted leg
 /// into its gait phase-0 position.
 const STEP_SWING_SECS: f64 = 0.5;
+/// Extra forward body advance (m) beyond the furthest-back leg's gap, so every
+/// A2 step is a forward step (the trailing leg lands slightly ahead, not back).
+const STEP_FWD_MARGIN: f64 = 0.02;
 /// Order in which legs are stepped into the gait's phase-0 contact pattern
 /// (canonical `LegId::ALL` slots: FL=0, FR=1, RL=2, RR=3). Diagonal alternation
 /// keeps consecutive lifts on opposite corners.
@@ -1842,9 +1845,22 @@ fn run_hardware(
         let mut cur_world: [nalgebra::Vector3<f64>; 4] = std::array::from_fn(|slot| {
             foot_body_of(&legs_kin[slot], &start_leveled, CANON_TO_GO2_BASE[slot], &signs[slot])
         });
-        // Build a full joint command from world foot targets; `lifted` overrides
-        // one leg's target with its in-air swing position.
+        // Advance the body FORWARD over A2 so every leg steps forward (no
+        // backward pulls). The body translates by `body_adv`; since a foot's
+        // body-frame target is `world - body`, the gait-relative landing stays at
+        // `spread` (reachable, continuous with Phase C) — only the world-frame
+        // swing direction turns forward. `body_adv` covers the furthest-back
+        // leg's gap (+ margin) so even it lands slightly ahead of where it began.
+        let back_max = (0..4)
+            .map(|s| cur_world[s].x - spread[s].x)
+            .fold(0.0, f64::max);
+        let body_adv = if back_max > 0.0 { back_max + STEP_FWD_MARGIN } else { 0.0 };
+        let target_world: [nalgebra::Vector3<f64>; 4] =
+            std::array::from_fn(|s| spread[s] + nalgebra::Vector3::new(body_adv, 0.0, 0.0));
+        // Joint command from world foot targets and the body's forward offset;
+        // `lifted` overrides one leg's world target with its in-air swing point.
         let make_q = |cur: &[nalgebra::Vector3<f64>; 4],
+                      body_x: f64,
                       lifted: Option<(usize, nalgebra::Vector3<f64>)>|
          -> [f64; 12] {
             let mut q = [0.0f64; 12];
@@ -1853,15 +1869,17 @@ fn run_hardware(
                     Some((ls, lw)) if ls == slot => lw,
                     _ => cur[slot],
                 };
-                ik_into(&mut q, &legs_kin[slot], w, CANON_TO_GO2_BASE[slot], &signs[slot]);
+                let fb = nalgebra::Vector3::new(w.x - body_x, w.y, w.z);
+                ik_into(&mut q, &legs_kin[slot], fb, CANON_TO_GO2_BASE[slot], &signs[slot]);
             }
             q
         };
         let swing_n = ticks(step_swing_secs);
-        for &l in STEP_ORDER.iter() {
-            // Swing leg `l` from where it is to its gait phase-0 position, in the
-            // air; the other three stay planted.
-            let (from, to) = (cur_world[l], spread[l]);
+        let nlegs = STEP_ORDER.len() as f64;
+        for (idx, &l) in STEP_ORDER.iter().enumerate() {
+            // Swing leg `l` forward (in the air) to its phase-0 landing, while the
+            // body keeps advancing; the other three stay planted.
+            let (from, to) = (cur_world[l], target_world[l]);
             for i in 0..swing_n {
                 let u = i as f64 / swing_n as f64;
                 let s = u * u * (3.0 - 2.0 * u);
@@ -1871,13 +1889,18 @@ fn run_hardware(
                     from.y + s * (to.y - from.y),
                     to.z + lift,
                 );
-                let q = make_q(&cur_world, Some((l, lw)));
+                let body_x = (idx as f64 + u) / nlegs * body_adv;
+                let q = make_q(&cur_world, body_x, Some((l, lw)));
                 emit(&q, &ZERO_TAU, kp, kd)?;
             }
-            cur_world[l] = spread[l];
+            cur_world[l] = target_world[l];
         }
-        hold_pose = Some(make_q(&cur_world, None));
-        eprintln!("startup-align: stepped feet into gait phase-0 contact pattern");
+        // All feet are now at `spread + body_adv` with the body at `body_adv`, so
+        // each foot's body-frame target is exactly `spread` — the gait phase-0.
+        hold_pose = Some(make_q(&cur_world, body_adv, None));
+        eprintln!(
+            "startup-align: stepped feet forward into gait phase-0 pattern (body +{body_adv:.3} m)"
+        );
     }
 
     eprintln!("phase,t_s,roll,pitch,FRt_cmd,FRt_act,FRc_cmd,FRc_act");
