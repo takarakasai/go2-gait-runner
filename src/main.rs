@@ -1461,6 +1461,15 @@ impl BodyObserver {
 /// truth for this map elsewhere is `leg_q_dq_ik` / `output_to_go2`.
 const CANON_TO_GO2_BASE: [usize; 4] = [3, 0, 9, 6];
 
+/// Quintic smootherstep on [0, 1]: maps 0→0, 1→1 with zero 1st *and* 2nd
+/// derivative at both ends, so a motion eased through it leaves/enters rest with
+/// zero velocity and zero acceleration (jerk-limited transient).
+#[inline]
+fn smootherstep(p: f64) -> f64 {
+    let p = p.clamp(0.0, 1.0);
+    p * p * p * (p * (p * 6.0 - 15.0) + 10.0)
+}
+
 /// Convert a leg's three Go2-motor joint angles to the IK convention
 /// (`q_ik = q_motor · sign`), run FK, and return the body-frame foot position.
 fn foot_body_of(lk: &quadruped_gait::LegKinematics, q: &[f64; 12], base: usize, sg: &[f64; 3]) -> nalgebra::Vector3<f64> {
@@ -1902,7 +1911,11 @@ fn run_hardware(
                     from.y + s * (to.y - from.y),
                     to.z + lift,
                 );
-                let body_x = (idx as f64 + u) / nlegs * body_adv;
+                // Ease the body translation through smootherstep over the whole
+                // A2 so it leaves/enters rest with zero velocity & acceleration
+                // (no lurch into or out of the creep). Foot swings keep their own
+                // per-leg smoothstep/sin profiles.
+                let body_x = smootherstep((idx as f64 + u) / nlegs) * body_adv;
                 let q = make_q(&cur_world, body_x, Some((l, lw)));
                 emit(&q, &ZERO_TAU, kp, kd)?;
             }
@@ -2185,9 +2198,11 @@ fn run_hardware(
             record(sample.as_ref(), &q, cmd_vel, last_stance, "C", b_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
         }
         // Decelerate to a stop before folding (gait eases back toward nominal).
+        // Smootherstep the speed down so deceleration starts and ends at zero
+        // acceleration (jerk-limited stop), matching the gait's soft-start ease-in.
         let accel_n = ticks(ACCEL_SECS);
         for i in 0..accel_n {
-            let v = vx_target * (1.0 - i as f64 / accel_n as f64);
+            let v = vx_target * (1.0 - smootherstep(i as f64 / accel_n as f64));
             cmd_vel = VelocityCmd { vx: v, vy: 0.0, wz: 0.0 };
             ctrl.set_velocity_cmd(cmd_vel);
             let _sample = poll_state!();
