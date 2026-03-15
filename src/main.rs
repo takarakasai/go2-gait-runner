@@ -189,6 +189,7 @@ struct Cli {
 /// Named flags that act as presence booleans (no value consumed).
 const BOOL_FLAGS: &[&str] = &[
     "ff", "grav-ff", "no-release", "restore", "smooth-swing", "level", "viz", "led-3support",
+    "step-noadvance",
 ];
 
 fn parse_cli(args: impl Iterator<Item = String>) -> Cli {
@@ -337,6 +338,8 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --forward S       forward phase, seconds   (default 4)        [run/diag]
   --settle S        hold after leveling, before A2 (default 0)  [run/diag]
   --step-swing S    Phase A2 per-leg swing, s (default 0.5; ×4 legs) [run/diag]
+  --step-noadvance  A2 swings feet straight to phase-0 (no body advance;
+                    some legs step back). Default advances body, all forward.
   --kp K            position gain            (default 60)        [run/diag]
   --kd K            damping gain             (default 5)         [run/diag]
   --swing H         foot lift height, m      (default 0.04)
@@ -479,6 +482,10 @@ fn main() {
             // optional settle hold after leveling (Phase A) before A2 begins.
             let step_swing = cli.f64("step-swing").unwrap_or(STEP_SWING_SECS);
             let settle = cli.f64("settle").unwrap_or(0.0);
+            // `--step-noadvance` selects the original A2: swing each foot straight
+            // to its phase-0 target without advancing the body (some legs step
+            // backward). Default advances the body so every leg steps forward.
+            let step_noadvance = cli.flag("step-noadvance");
             let kp = cli.f32("kp").unwrap_or(60.0);
             let kd = cli.f32("kd").unwrap_or(5.0);
             let ff = cli.flag("ff") || cli.flag("grav-ff");
@@ -546,8 +553,8 @@ fn main() {
             // `run` and `diag` are the same path now; both always read state back
             // and print the tracking/tilt summary. `diag` is kept as an alias.
             let res = run_hardware(
-                &iface, &misa, vx, inplace, forward, step_swing, settle, kp, kd, tune, ff,
-                ff_scale, level_gain, csv, &viz_cfg, led_3support, led_margin,
+                &iface, &misa, vx, inplace, forward, step_swing, settle, step_noadvance, kp, kd,
+                tune, ff, ff_scale, level_gain, csv, &viz_cfg, led_3support, led_margin,
                 led_color.as_deref(), led_base_color.as_deref(),
             );
             if let Err(e) = res {
@@ -1527,6 +1534,7 @@ fn run_hardware(
     forward_secs: f64,
     step_swing_secs: f64,
     settle_secs: f64,
+    step_noadvance: bool,
     kp: f32,
     kd: f32,
     tune: GaitTune,
@@ -1551,7 +1559,8 @@ fn run_hardware(
     ctrl.reset();
 
     eprintln!(
-        "go2-gait-runner: LinearCrawl vx={vx_target} settle={settle_secs}s step_swing={step_swing_secs}s inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} stance_height={:.3} cycle={:?} four_support={:?} max_swing_speed={:?} grav_ff={ff} ff_scale={ff_scale} smooth_swing={} level_gain={level_gain} CoM=({:.3},{:.3})",
+        "go2-gait-runner: LinearCrawl vx={vx_target} settle={settle_secs}s step_swing={step_swing_secs}s step_advance={} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} stance_height={:.3} cycle={:?} four_support={:?} max_swing_speed={:?} grav_ff={ff} ff_scale={ff_scale} smooth_swing={} level_gain={level_gain} CoM=({:.3},{:.3})",
+        if step_noadvance { "off" } else { "on" },
         tune.stance_height, tune.cycle_s, tune.four_support, tune.max_swing_foot_speed, tune.smooth_swing, com.x, com.y
     );
     eprintln!("  sport_mode released via native RPC (unless --no-release); ensure the area is clear ...");
@@ -1854,7 +1863,11 @@ fn run_hardware(
         let back_max = (0..4)
             .map(|s| cur_world[s].x - spread[s].x)
             .fold(0.0, f64::max);
-        let body_adv = if back_max > 0.0 { back_max + STEP_FWD_MARGIN } else { 0.0 };
+        let body_adv = if step_noadvance || back_max <= 0.0 {
+            0.0
+        } else {
+            back_max + STEP_FWD_MARGIN
+        };
         let target_world: [nalgebra::Vector3<f64>; 4] =
             std::array::from_fn(|s| spread[s] + nalgebra::Vector3::new(body_adv, 0.0, 0.0));
         // Joint command from world foot targets and the body's forward offset;
