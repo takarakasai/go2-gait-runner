@@ -1,0 +1,18 @@
+@startuml
+title Go2 ソフトウェアスタック — レイヤ構成
+skinparam shadowing false
+skinparam defaultFontName "Noto Sans CJK JP"
+skinparam roundCorner 12
+skinparam rectangleBorderColor #4A6FA5
+
+rectangle "アプリ機能層  (/unitree/module/* : 27モジュール)\n移動制御 / 知覚 / ナビ / 音声・UI / アプリ接続 / クラウド" as L1 #E8F0FE
+rectangle "ミドルウェア層\nCycloneDDS (rt/* トピック)  +  iceoryx 共有メモリ (iox-roudi, ゼロコピー)" as L2 #E8F5E9
+rectangle "サービス管理層\nmaster_service ／ mscli (CLI) ／ start-stop-daemon\n(/etc/init.d/master_service から起動)" as L3 #FFF3E0
+rectangle "OS / ドライバ層\nDebian系 + PREEMPT_RT カーネル / systemd / udev / bluetoothd / dhcp" as L4 #F3E5F5
+rectangle "ハードウェア層\nJetson(メインPC) ／ 各MCU(モータ/IMU/電源) ／ LiDAR L1 / カメラ / UWB" as L5 #ECEFF1
+
+L1 -down-> L2
+L2 -down-> L3
+L3 -down-> L4
+L4 -down-> L5
+@enduml

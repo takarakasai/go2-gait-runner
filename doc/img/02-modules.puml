@@ -1,0 +1,52 @@
+@startuml
+title Go2 機能モジュール (mscli 27サービス / enable状態)
+skinparam shadowing false
+skinparam defaultFontName "Noto Sans CJK JP"
+skinparam componentStyle rectangle
+legend right
+  <b>凡例</b>
+  通常枠 = enable:1 (起動時自動起動)
+  <back:#FFCDD2>赤背景</back> = enable:0 / 非稼働
+endlegend
+
+package "移動・制御" #E3F2FD {
+  [sport_mode\n(Legged_sport)\n★立位/歩行の本体] as sport
+  [motion_switcher\nモード切替/release・restore] as msw
+  [robot_state] as rstate
+  [basic_service] as basic
+  [sbus_handle\nプロポ(SBUS)入力] as sbus
+  [programming_actuator\n動作教示] as prog
+  [advanced_sport] as adv #FFCDD2
+  [ai_sport] as ais #FFCDD2
+}
+package "知覚・ナビ" #E8F5E9 {
+  [unitree_lidar\nL1 LiDARドライバ] as lidar
+  [unitree_lidar_slam\nSLAM] as slam
+  [voxel_height_mapping\n高さマップ] as voxel
+  [obstacles_avoid\n障害物回避] as obs
+  [video_hub\n映像] as video
+  [utrack\nUWB追従] as utrack
+}
+package "音声・UI・対話" #FFF3E0 {
+  [vui_service\n音声UI + 頭部LED] as vui
+  [audio_hub] as audio
+  [chat_go\nAI対話(要クラウド)] as chat
+  [pet_go / gesture\n(非稼働)] as pet #FFCDD2
+}
+package "接続・ネット・クラウド" #F3E5F5 {
+  [webrtc_bridge\nアプリ接続(WebRTC)] as webrtc
+  [net_switcher\n回線切替] as netsw
+  [network_manager\n(BLE: btgatt-server)] as netmgr
+  [ota_box\nOTA + クラウドMQTT] as ota
+  [bashrunner\nリモート実行] as bash
+  [4gcm (OFF)] as fourg #FFCDD2
+}
+package "基盤" #ECEFF1 {
+  [master_service\nサービス管理] as master
+  [iox-roudi\niceoryx共有メモリ] as roudi
+}
+
+msw --> sport
+sbus --> sport
+webrtc --> msw
+@enduml

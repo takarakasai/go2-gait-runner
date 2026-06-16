@@ -1,0 +1,62 @@
+@startuml
+title Go2 データフロー — 知覚 → 制御 → アクチュエータ (全て rt/* DDS + SHM)
+skinparam shadowing false
+skinparam defaultFontName "Noto Sans CJK JP"
+left to right direction
+
+actor "プロポ(SBUS)" as remote
+actor "スマホアプリ" as app
+actor "開発PC\n(go2-gait-runner)" as devpc
+
+rectangle "LiDAR L1" as hwlidar
+rectangle "カメラ" as hwcam
+rectangle "UWB" as hwuwb
+rectangle "IMU/関節 (MCU)" as hwmcu
+rectangle "モータ MCU" as motor
+
+component "unitree_lidar" as lidar
+component "unitree_lidar_slam" as slam
+component "voxel_height_mapping" as voxel
+component "video_hub" as video
+component "utrack" as utrack
+component "obstacles_avoid" as obs
+component "robot_state" as rstate
+component "sbus_handle" as sbus
+component "webrtc_bridge" as webrtc
+component "motion_switcher" as msw
+component "sport_mode\n(Legged_sport)" as sport
+
+rectangle "rt/lowstate" as lowstate #FFFDE7
+rectangle "rt/api/sport/*" as apisport #FFFDE7
+rectangle "rt/api/*" as api #FFFDE7
+rectangle "rt/lowcmd" as lowcmd #FFFDE7
+
+hwlidar --> lidar
+lidar --> slam
+slam --> voxel
+hwcam --> video
+hwuwb --> utrack
+voxel --> obs
+hwmcu --> lowstate
+lowstate --> rstate
+
+rstate --> msw
+obs --> msw
+remote --> sbus
+sbus --> apisport
+app --> webrtc
+webrtc --> api
+apisport --> msw
+api --> msw
+
+msw --> sport
+sport --> lowcmd
+devpc --> lowcmd : "sport_mode を release 後\n直接送出"
+lowcmd --> motor
+
+note bottom
+  結合は全て CycloneDDS(rt/*) + iceoryx 共有メモリ。
+  開発PCは eth0 の同一DDSドメインに参加して rt/lowcmd を直接送る。
+  クラウド(MQTTS)/アプリ(WebRTC,BLE)は wlan0 経由。
+end note
+@enduml

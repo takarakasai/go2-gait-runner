@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" contentScriptType="application/ecmascript" contentStyleType="text/css" height="609px" preserveAspectRatio="none" style="width:504px;height:609px;" version="1.1" viewBox="0 0 504 609" width="504px" zoomAndPan="magnify"><defs/><g><text fill="#000000" font-family="Noto Sans CJK JP" font-size="18" lengthAdjust="spacingAndGlyphs" textLength="331" x="90" y="20.8799">Go2 ソフトウェアスタック — レイヤ構成</text><!--MD5=[769f808af18dc41ae3926100e72323f0]
+entity L1--><rect fill="#E8F0FE" height="60.5438" rx="6" ry="6" style="stroke: #4A6FA5; stroke-width: 1.5;" width="369" x="65" y="34.0638"/><text fill="#000000" font-family="Noto Sans CJK JP" font-size="14" lengthAdjust="spacingAndGlyphs" textLength="317" x="75" y="60.3038">アプリ機能層  (/unitree/module/* : 27モジュール)</text><text fill="#000000" font-family="Noto Sans CJK JP" font-size="14" lengthAdjust="spacingAndGlyphs" textLength="349" x="75" y="80.5757">移動制御 / 知覚 / ナビ / 音声・UI / アプリ接続 / クラウド</text><!--MD5=[5fa073e7557ceedd5ffab818dd99475f]
+entity L2--><rect fill="#E8F5E9" height="60.5438" rx="6" ry="6" style="stroke: #4A6FA5; stroke-width: 1.5;" width="482" x="8.5" y="155.0638"/><text fill="#000000" font-family="Noto Sans CJK JP" font-size="14" lengthAdjust="spacingAndGlyphs" textLength="98" x="18.5" y="181.3038">ミドルウェア層</text><text fill="#000000" font-family="Noto Sans CJK JP" font-size="14" lengthAdjust="spacingAndGlyphs" textLength="462" x="18.5" y="201.5757">CycloneDDS (rt/* トピック)  +  iceoryx 共有メモリ (iox-roudi, ゼロコピー)</text><!--MD5=[cdde8203267486659c77309d7f77d4ce]
+entity L3--><rect fill="#FFF3E0" height="80.8157" rx="6" ry="6" style="stroke: #4A6FA5; stroke-width: 1.5;" width="353" x="73" y="276.0638"/><text fill="#000000" font-family="Noto Sans CJK JP" font-size="14" lengthAdjust="spacingAndGlyphs" textLength="98" x="83" y="302.3038">サービス管理層</text><text fill="#000000" font-family="Noto Sans CJK JP" font-size="14" lengthAdjust="spacingAndGlyphs" textLength="333" x="83" y="322.5757">master_service ／ mscli (CLI) ／ start-stop-daemon</text><text fill="#000000" font-family="Noto Sans CJK JP" font-size="14" lengthAdjust="spacingAndGlyphs" textLength="239" x="83" y="342.8476">(/etc/init.d/master_service から起動)</text><!--MD5=[6028a18b9c459cd39f6b03b8fed084fc]
+entity L4--><rect fill="#F3E5F5" height="60.5438" rx="6" ry="6" style="stroke: #4A6FA5; stroke-width: 1.5;" width="483" x="8" y="417.0638"/><text fill="#000000" font-family="Noto Sans CJK JP" font-size="14" lengthAdjust="spacingAndGlyphs" textLength="99" x="18" y="443.3038">OS / ドライバ層</text><text fill="#000000" font-family="Noto Sans CJK JP" font-size="14" lengthAdjust="spacingAndGlyphs" textLength="463" x="18" y="463.5757">Debian系 + PREEMPT_RT カーネル / systemd / udev / bluetoothd / dhcp</text><!--MD5=[16f0e411f887cdceddc4d0567ce69ff7]
+entity L5--><rect fill="#ECEFF1" height="60.5438" rx="6" ry="6" style="stroke: #4A6FA5; stroke-width: 1.5;" width="487" x="6" y="538.0638"/><text fill="#000000" font-family="Noto Sans CJK JP" font-size="14" lengthAdjust="spacingAndGlyphs" textLength="98" x="16" y="564.3038">ハードウェア層</text><text fill="#000000" font-family="Noto Sans CJK JP" font-size="14" lengthAdjust="spacingAndGlyphs" textLength="467" x="16" y="584.5757">Jetson(メインPC) ／ 各MCU(モータ/IMU/電源) ／ LiDAR L1 / カメラ / UWB</text><!--MD5=[78071b9655e1d2df655a482f57934b02]
+link L1 to L2--><path d="M249.5,95.2838 C249.5,111.7538 249.5,132.3238 249.5,149.5738 " fill="none" id="L1-&gt;L2" style="stroke: #A80036; stroke-width: 1.0;"/><polygon fill="#A80036" points="249.5,154.8038,253.5,145.8038,249.5,149.8038,245.5,145.8038,249.5,154.8038" style="stroke: #A80036; stroke-width: 1.0;"/><!--MD5=[cd884ebc2a9a3d05fe1796a968a3920c]
+link L2 to L3--><path d="M249.5,216.1638 C249.5,232.3438 249.5,252.7138 249.5,270.8038 " fill="none" id="L2-&gt;L3" style="stroke: #A80036; stroke-width: 1.0;"/><polygon fill="#A80036" points="249.5,275.8338,253.5,266.8338,249.5,270.8338,245.5,266.8338,249.5,275.8338" style="stroke: #A80036; stroke-width: 1.0;"/><!--MD5=[632b61f887e8f18515b53c192df74512]
+link L3 to L4--><path d="M249.5,357.3238 C249.5,374.7638 249.5,395.0538 249.5,411.8738 " fill="none" id="L3-&gt;L4" style="stroke: #A80036; stroke-width: 1.0;"/><polygon fill="#A80036" points="249.5,416.9738,253.5,407.9738,249.5,411.9738,245.5,407.9738,249.5,416.9738" style="stroke: #A80036; stroke-width: 1.0;"/><!--MD5=[cb6813db87acf1d8edf63aac808d1bf5]
+link L4 to L5--><path d="M249.5,478.2838 C249.5,494.7538 249.5,515.3238 249.5,532.5738 " fill="none" id="L4-&gt;L5" style="stroke: #A80036; stroke-width: 1.0;"/><polygon fill="#A80036" points="249.5,537.8038,253.5,528.8038,249.5,532.8038,245.5,528.8038,249.5,537.8038" style="stroke: #A80036; stroke-width: 1.0;"/><!--MD5=[87daca1d6a2f5ca327de5e98e4355cc2]
+@startuml
+title Go2 ソフトウェアスタック — レイヤ構成
+skinparam shadowing false
+skinparam defaultFontName "Noto Sans CJK JP"
+skinparam roundCorner 12
+skinparam rectangleBorderColor #4A6FA5
+
+rectangle "アプリ機能層  (/unitree/module/* : 27モジュール)\n移動制御 / 知覚 / ナビ / 音声・UI / アプリ接続 / クラウド" as L1 #E8F0FE
+rectangle "ミドルウェア層\nCycloneDDS (rt/* トピック)  +  iceoryx 共有メモリ (iox-roudi, ゼロコピー)" as L2 #E8F5E9
+rectangle "サービス管理層\nmaster_service ／ mscli (CLI) ／ start-stop-daemon\n(/etc/init.d/master_service から起動)" as L3 #FFF3E0
+rectangle "OS / ドライバ層\nDebian系 + PREEMPT_RT カーネル / systemd / udev / bluetoothd / dhcp" as L4 #F3E5F5
+rectangle "ハードウェア層\nJetson(メインPC) ／ 各MCU(モータ/IMU/電源) ／ LiDAR L1 / カメラ / UWB" as L5 #ECEFF1
+
+L1 -down-> L2
+L2 -down-> L3
+L3 -down-> L4
+L4 -down-> L5
+@enduml
+
+PlantUML version 1.2020.02(Sun Mar 01 19:22:07 JST 2020)
+(GPL source distribution)
+Java Runtime: OpenJDK Runtime Environment
+JVM: OpenJDK 64-Bit Server VM
+Java Version: 11.0.31+11-post-1ubuntu1-22.04.2-Ubuntu
+Operating System: Linux
+Default Encoding: UTF-8
+Language: en
+Country: US
+--></g></svg>

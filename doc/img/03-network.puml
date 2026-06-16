@@ -1,0 +1,36 @@
+@startuml
+title Go2 ネットワーク配置 — 内部(eth0) / 外部(wlan0) の2系統
+skinparam shadowing false
+skinparam defaultFontName "Noto Sans CJK JP"
+
+node "開発PC\n192.168.123.99/24" as pc #E3F2FD
+
+node "Go2 ロボット (Jetson)\nホスト名: Unitree" as robot {
+  interface "eth0\n192.168.123.161/24" as eth
+  interface "wlan0\n192.168.0.37/24" as wlan
+  component "DDS ドメイン (CycloneDDS)\nrt/* + iceoryx(SHM)\nbind: eth0" as dds
+  component "webrtc_bridge\nシグナリング TCP 9991" as wb
+  component "ota_boxed\nMQTTSクライアント" as otab
+  component "btgatt-server (BLE/hci0)" as ble
+  eth -- dds
+  wb -- wlan
+  otab -- wlan
+}
+
+cloud "インターネット" as net
+node "Unitreeクラウド\nrobot-mqtt.unitree.com:17883\n(実接続 47.237.218.120 / Alibaba)" as ucloud #FFF3E0
+node "スマホアプリ\n(Unitree Go)" as app #E8F5E9
+
+pc <-down-> eth : "<b>DDS (UDP 7400/7401)</b>\nrt/lowcmd / rt/lowstate\n※go2-gait-runner はここ"
+wlan -down-> net : "default route\nGW 192.168.0.1"
+net -down-> ucloud
+otab ..> ucloud : "MQTTS 常時接続\n30分毎にバージョン報告 / OTA確認"
+app -up-> wb : "WebRTC (LAN: マルチキャスト探索)"
+app ..> net : "リモート時はクラウド経由"
+app ..> ble : "初期設定 (WiFi投入)"
+
+note bottom of robot
+  wlan1: DOWN  /  4G(4gcm): OFF
+  内部&開発=eth0(DDS固定)  外部=wlan0(クラウド/アプリ)
+end note
+@enduml
