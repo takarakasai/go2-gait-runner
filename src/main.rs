@@ -189,6 +189,7 @@ struct Cli {
 /// Named flags that act as presence booleans (no value consumed).
 const BOOL_FLAGS: &[&str] = &[
     "ff", "grav-ff", "no-release", "restore", "smooth-swing", "level", "viz", "led-3support",
+    "step-noadvance",
 ];
 
 fn parse_cli(args: impl Iterator<Item = String>) -> Cli {
@@ -286,6 +287,16 @@ const RAMP_SECS: f64 = 2.0;
 const ACCEL_SECS: f64 = 1.5;
 /// Seconds to ramp the final stance into the folded pose on exit.
 const FOLD_SECS: f64 = 2.0;
+/// Startup gait-alignment (Phase A2): per-leg seconds to swing the lifted leg
+/// into its gait phase-0 position.
+const STEP_SWING_SECS: f64 = 0.5;
+/// Extra forward body advance (m) beyond the furthest-back leg's gap, so every
+/// A2 step is a forward step (the trailing leg lands slightly ahead, not back).
+const STEP_FWD_MARGIN: f64 = 0.02;
+/// Order in which legs are stepped into the gait's phase-0 contact pattern
+/// (canonical `LegId::ALL` slots: FL=0, FR=1, RL=2, RR=3). Diagonal alternation
+/// keeps consecutive lifts on opposite corners.
+const STEP_ORDER: [usize; 4] = [1, 2, 0, 3]; // FR, RL, FL, RR
 
 /// Full usage for every mode and flag (`-h` / `--help`).
 fn print_help() {
@@ -325,6 +336,10 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --vx V            forward speed, m/s       (run/diag default 0.0; intent 0.05)
   --inplace S       in-place phase, seconds  (default 3)        [run/diag]
   --forward S       forward phase, seconds   (default 4)        [run/diag]
+  --settle S        hold after leveling, before A2 (default 0)  [run/diag]
+  --step-swing S    Phase A2 per-leg swing, s (default 0.5; ×4 legs) [run/diag]
+  --step-noadvance  A2 swings feet straight to phase-0 (no body advance;
+                    some legs step back). Default advances body, all forward.
   --kp K            position gain            (default 60)        [run/diag]
   --kd K            damping gain             (default 5)         [run/diag]
   --swing H         foot lift height, m      (default 0.04)
@@ -463,6 +478,14 @@ fn main() {
             let vx = cli.f64("vx").unwrap_or(0.0);
             let inplace = cli.f64("inplace").unwrap_or(3.0);
             let forward = cli.f64("forward").unwrap_or(4.0);
+            // Startup gait-alignment (Phase A2) per-leg swing seconds, and an
+            // optional settle hold after leveling (Phase A) before A2 begins.
+            let step_swing = cli.f64("step-swing").unwrap_or(STEP_SWING_SECS);
+            let settle = cli.f64("settle").unwrap_or(0.0);
+            // `--step-noadvance` selects the original A2: swing each foot straight
+            // to its phase-0 target without advancing the body (some legs step
+            // backward). Default advances the body so every leg steps forward.
+            let step_noadvance = cli.flag("step-noadvance");
             let kp = cli.f32("kp").unwrap_or(60.0);
             let kd = cli.f32("kd").unwrap_or(5.0);
             let ff = cli.flag("ff") || cli.flag("grav-ff");
@@ -530,9 +553,9 @@ fn main() {
             // `run` and `diag` are the same path now; both always read state back
             // and print the tracking/tilt summary. `diag` is kept as an alias.
             let res = run_hardware(
-                &iface, &misa, vx, inplace, forward, kp, kd, tune, ff, ff_scale, level_gain, csv,
-                &viz_cfg, led_3support, led_margin, led_color.as_deref(),
-                led_base_color.as_deref(),
+                &iface, &misa, vx, inplace, forward, step_swing, settle, step_noadvance, kp, kd,
+                tune, ff, ff_scale, level_gain, csv, &viz_cfg, led_3support, led_margin,
+                led_color.as_deref(), led_base_color.as_deref(),
             );
             if let Err(e) = res {
                 eprintln!("error: {e}");
@@ -1433,6 +1456,72 @@ impl BodyObserver {
     }
 }
 
+/// Canonical leg (`LegId::ALL` order [FL, FR, RL, RR]) → Go2 motor base index
+/// (FR=0, FL=3, RR=6, RL=9). So FL→3, FR→0, RL→9, RR→6. The single source of
+/// truth for this map elsewhere is `leg_q_dq_ik` / `output_to_go2`.
+const CANON_TO_GO2_BASE: [usize; 4] = [3, 0, 9, 6];
+
+/// Convert a leg's three Go2-motor joint angles to the IK convention
+/// (`q_ik = q_motor · sign`), run FK, and return the body-frame foot position.
+fn foot_body_of(lk: &quadruped_gait::LegKinematics, q: &[f64; 12], base: usize, sg: &[f64; 3]) -> nalgebra::Vector3<f64> {
+    quadruped_gait::forward_leg_kinematics(lk, q[base] * sg[0], q[base + 1] * sg[1], q[base + 2] * sg[2])
+}
+
+/// Solve IK for a body-frame foot target and write the three resulting angles
+/// into `q` at `base`, in Go2-motor convention (`q_motor = q_ik · sign`). The
+/// closest reachable configuration is used if the target is just outside the
+/// envelope (`solve_leg_ik` already clamps), so the command is always valid.
+fn ik_into(
+    q: &mut [f64; 12],
+    lk: &quadruped_gait::LegKinematics,
+    target: nalgebra::Vector3<f64>,
+    base: usize,
+    sg: &[f64; 3],
+) {
+    let (h, t, c) = quadruped_gait::solve_leg_ik(lk, target, false).angles();
+    q[base] = h * sg[0];
+    q[base + 1] = t * sg[1];
+    q[base + 2] = c * sg[2];
+}
+
+/// Re-level the captured `start` pose to the gait's stance **height** while
+/// keeping each foot's horizontal `(x, y)` position where the operator placed
+/// it. Returns the re-leveled joint vector in Go2 motor order.
+///
+/// Phase A ramps `start → start_leveled`: with the feet horizontally fixed this
+/// is essentially a vertical body move (a squat up/down), which brings the body
+/// to the commanded `--stance-height` *without* dragging the planted feet
+/// sideways. The remaining, now purely-horizontal, discrepancy
+/// `start_leveled − stance` is then removed by Phase A2, which steps each foot
+/// to nominal through the air.
+///
+/// Per leg: FK(`start`) and FK(`stance`) give the two foot positions; the target
+/// keeps `start`'s `(x, y)` but takes `stance`'s `z`, and IK maps it back to
+/// joints. A leg whose target is unreachable is left at its `start` angles
+/// (never command a clamped/garbage pose on hardware).
+fn level_start_to_stance_height(
+    start: &[f64; 12],
+    stance: &[f64; 12],
+    kin: &quadruped_gait::KinematicsConfig,
+    signs: &[[f64; 3]; 4],
+) -> [f64; 12] {
+    let mut out = *start;
+    for slot in 0..4 {
+        let lk = kin.leg(LegId::ALL[slot]);
+        let base = CANON_TO_GO2_BASE[slot];
+        let sg = &signs[slot];
+        let p_start = foot_body_of(lk, start, base, sg);
+        let p_stance = foot_body_of(lk, stance, base, sg);
+        // Keep the operator's horizontal foot position, adopt the stance height.
+        let target = nalgebra::Vector3::new(p_start.x, p_start.y, p_stance.z);
+        // Go2 stands knees-back (`KneePattern::BothBack`) ⇒ knee_forward = false.
+        if quadruped_gait::solve_leg_ik(lk, target, false).is_reachable() {
+            ik_into(&mut out, lk, target, base, sg);
+        }
+    }
+    out
+}
+
 /// size kp/kd: large stance tracking error ⇒ the legs sag under load ⇒ raise kp).
 /// With `csv_path` set, every recorded tick is also written as a full-telemetry
 /// CSV row. Both the `run` and `diag` CLI modes call this single path.
@@ -1443,6 +1532,9 @@ fn run_hardware(
     vx_target: f64,
     inplace_secs: f64,
     forward_secs: f64,
+    step_swing_secs: f64,
+    settle_secs: f64,
+    step_noadvance: bool,
     kp: f32,
     kd: f32,
     tune: GaitTune,
@@ -1467,7 +1559,8 @@ fn run_hardware(
     ctrl.reset();
 
     eprintln!(
-        "go2-gait-runner: LinearCrawl vx={vx_target} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} stance_height={:.3} cycle={:?} four_support={:?} max_swing_speed={:?} grav_ff={ff} ff_scale={ff_scale} smooth_swing={} level_gain={level_gain} CoM=({:.3},{:.3})",
+        "go2-gait-runner: LinearCrawl vx={vx_target} settle={settle_secs}s step_swing={step_swing_secs}s step_advance={} inplace={inplace_secs}s forward={forward_secs}s kp={kp} kd={kd} swing_h={swing_h} stance_height={:.3} cycle={:?} four_support={:?} max_swing_speed={:?} grav_ff={ff} ff_scale={ff_scale} smooth_swing={} level_gain={level_gain} CoM=({:.3},{:.3})",
+        if step_noadvance { "off" } else { "on" },
         tune.stance_height, tune.cycle_s, tune.four_support, tune.max_swing_foot_speed, tune.smooth_swing, com.x, com.y
     );
     eprintln!("  sport_mode released via native RPC (unless --no-release); ensure the area is clear ...");
@@ -1487,6 +1580,11 @@ fn run_hardware(
         .map_err(|e| format!("reader: {e}"))?;
 
     let start = wait_for_start_pose(&reader)?;
+    // Re-level the start pose to the gait's stance height (feet stay horizontally
+    // where they are). Phase A ramps to this; the leftover horizontal offset is
+    // bled out in the air. This keeps `--stance-height` honoured from the end of
+    // Phase A while still avoiding the startup foot-scuffing.
+    let start_leveled = level_start_to_stance_height(&start, &stance, ctrl.kinematics(), &signs);
 
     // ── Head-LED 3-support indicator (`--led-3support`) ──────────────
     // The LED is driven over the VUI service, whose RPC is request/response
@@ -1686,15 +1784,136 @@ fn run_hardware(
         None => None,
     };
 
-    // Phase A: ramp to stance.
+    // Phase A: raise the body to the gait's stance HEIGHT while raising kp 0→kp.
+    // Interpolating in CARTESIAN foot space — holding each foot's (x, y) fixed at
+    // where the operator placed it and ramping only its z to the stance height —
+    // means the feet never move horizontally during the ramp, so the body rises
+    // (or sinks) into `--stance-height` with zero horizontal scuffing. (A naive
+    // joint-space lerp `start → start_leveled` shares the same x,y endpoints but
+    // bows the foot sideways mid-ramp, which scuffs — that was the residual
+    // startup scuff.) At p=1 this equals `start_leveled`, continuous with the
+    // gait phase below.
+    let level_feet: Vec<(quadruped_gait::LegKinematics, [f64; 3], usize, nalgebra::Vector3<f64>, f64)> =
+        (0..4)
+            .map(|slot| {
+                let lk = ctrl.kinematics().leg(LegId::ALL[slot]).clone();
+                let sg = signs[slot];
+                let base = CANON_TO_GO2_BASE[slot];
+                let p_start = foot_body_of(&lk, &start, base, &sg);
+                let z_target = foot_body_of(&lk, &stance, base, &sg).z;
+                (lk, sg, base, p_start, z_target)
+            })
+            .collect();
     let ramp_n = ticks(RAMP_SECS);
     for i in 0..ramp_n {
         let p = i as f64 / ramp_n as f64;
         let mut q = [0.0f64; 12];
-        for j in 0..12 {
-            q[j] = (1.0 - p) * start[j] + p * stance[j];
+        for (lk, sg, base, p_start, z_target) in level_feet.iter() {
+            let z = (1.0 - p) * p_start.z + p * z_target;
+            let foot = nalgebra::Vector3::new(p_start.x, p_start.y, z);
+            ik_into(&mut q, lk, foot, *base, sg);
         }
         emit(&q, &ZERO_TAU, (kp as f64 * p) as f32, kd)?;
+    }
+
+    // Optional settle hold: pause at the leveled pose after Phase A, before the
+    // Phase A2 gait-alignment steps begin (`--settle`, default 0 = no pause).
+    if settle_secs > 0.0 {
+        for _ in 0..ticks(settle_secs) {
+            emit(&start_leveled, &ZERO_TAU, kp, kd)?;
+        }
+    }
+
+    // Pose held during the in-place phase (the gait phase-0 contact pattern),
+    // set by Phase A2 below when there is forward motion to align to.
+    let mut hold_pose: Option<[f64; 12]> = None;
+    // Phase A2: step the feet into the gait's phase-0 contact pattern *before*
+    // the gait runs. A forward crawl's all-stance pose at cycle_phase 0 is NOT
+    // the symmetric nominal stance — each leg sits at a different point in its
+    // stance sweep (e.g. the next-to-swing leg is fully back, the just-landed
+    // leg is fully forward). If the gait simply starts from the symmetric stance
+    // it drags three planted feet into that spread, and the asymmetric drag
+    // shoves the body backward (the reported startup scuff). Here we instead
+    // place the feet there in the air: each leg is swung, one at a time, to its
+    // phase-0 target (no body weight-shift — swing only).
+    //
+    // `spread` is exactly the gait's first forward tick (vx_target, cycle_phase
+    // 0); Phase C below ticks the *same* gait from reset, so its first output
+    // matches the placed feet and motion eases in via the gait's soft-start.
+    let spread: [nalgebra::Vector3<f64>; 4] = {
+        let (_m, _hq, mut probe, _sg) = build_gait(misa_path, tune)?;
+        probe.set_velocity_cmd(VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 });
+        let out = probe.tick(CONTROL_DT);
+        std::array::from_fn(|slot| out.legs[slot].foot_body)
+    };
+    if vx_target > 0.0 {
+        let legs_kin: Vec<quadruped_gait::LegKinematics> =
+            (0..4).map(|s| ctrl.kinematics().leg(LegId::ALL[s]).clone()).collect();
+        // Current world-frame foot positions (feet are planted; the leveled
+        // start pose put them at the operator's x,y and the stance height).
+        let mut cur_world: [nalgebra::Vector3<f64>; 4] = std::array::from_fn(|slot| {
+            foot_body_of(&legs_kin[slot], &start_leveled, CANON_TO_GO2_BASE[slot], &signs[slot])
+        });
+        // Advance the body FORWARD over A2 so every leg steps forward (no
+        // backward pulls). The body translates by `body_adv`; since a foot's
+        // body-frame target is `world - body`, the gait-relative landing stays at
+        // `spread` (reachable, continuous with Phase C) — only the world-frame
+        // swing direction turns forward. `body_adv` covers the furthest-back
+        // leg's gap (+ margin) so even it lands slightly ahead of where it began.
+        let back_max = (0..4)
+            .map(|s| cur_world[s].x - spread[s].x)
+            .fold(0.0, f64::max);
+        let body_adv = if step_noadvance || back_max <= 0.0 {
+            0.0
+        } else {
+            back_max + STEP_FWD_MARGIN
+        };
+        let target_world: [nalgebra::Vector3<f64>; 4] =
+            std::array::from_fn(|s| spread[s] + nalgebra::Vector3::new(body_adv, 0.0, 0.0));
+        // Joint command from world foot targets and the body's forward offset;
+        // `lifted` overrides one leg's world target with its in-air swing point.
+        let make_q = |cur: &[nalgebra::Vector3<f64>; 4],
+                      body_x: f64,
+                      lifted: Option<(usize, nalgebra::Vector3<f64>)>|
+         -> [f64; 12] {
+            let mut q = [0.0f64; 12];
+            for slot in 0..4 {
+                let w = match lifted {
+                    Some((ls, lw)) if ls == slot => lw,
+                    _ => cur[slot],
+                };
+                let fb = nalgebra::Vector3::new(w.x - body_x, w.y, w.z);
+                ik_into(&mut q, &legs_kin[slot], fb, CANON_TO_GO2_BASE[slot], &signs[slot]);
+            }
+            q
+        };
+        let swing_n = ticks(step_swing_secs);
+        let nlegs = STEP_ORDER.len() as f64;
+        for (idx, &l) in STEP_ORDER.iter().enumerate() {
+            // Swing leg `l` forward (in the air) to its phase-0 landing, while the
+            // body keeps advancing; the other three stay planted.
+            let (from, to) = (cur_world[l], target_world[l]);
+            for i in 0..swing_n {
+                let u = i as f64 / swing_n as f64;
+                let s = u * u * (3.0 - 2.0 * u);
+                let lift = swing_h * (std::f64::consts::PI * u).sin();
+                let lw = nalgebra::Vector3::new(
+                    from.x + s * (to.x - from.x),
+                    from.y + s * (to.y - from.y),
+                    to.z + lift,
+                );
+                let body_x = (idx as f64 + u) / nlegs * body_adv;
+                let q = make_q(&cur_world, body_x, Some((l, lw)));
+                emit(&q, &ZERO_TAU, kp, kd)?;
+            }
+            cur_world[l] = target_world[l];
+        }
+        // All feet are now at `spread + body_adv` with the body at `body_adv`, so
+        // each foot's body-frame target is exactly `spread` — the gait phase-0.
+        hold_pose = Some(make_q(&cur_world, body_adv, None));
+        eprintln!(
+            "startup-align: stepped feet forward into gait phase-0 pattern (body +{body_adv:.3} m)"
+        );
     }
 
     eprintln!("phase,t_s,roll,pitch,FRt_cmd,FRt_act,FRc_cmd,FRc_act");
@@ -1914,7 +2133,6 @@ fn run_hardware(
     // Monotonic recorded-time offsets so the CSV's leading `t_s` runs
     // continuously across phases B and C instead of resetting each phase.
     let b_dur = ticks(inplace_secs) as f64 * CONTROL_DT;
-    let accel_dur = ticks(ACCEL_SECS) as f64 * CONTROL_DT;
 
     // Poll the reader once and refresh `last_rpy`; returns the sample so the
     // same read also feeds `record` (avoids draining the reader twice/tick).
@@ -1934,39 +2152,40 @@ fn run_hardware(
         }};
     }
 
-    // Phase B: in-place (vx=0), recording. `cmd_vel` mirrors the velocity sent
-    // to the gait generator each tick so `record` can log it (CSV cmd_* cols).
-    // Today this is driven by the CLI `vx_target`; when an external Twist source
-    // is wired in it will write the same `cmd_vel` and the columns stay valid.
+    // Phase B: in-place. With forward motion the feet are already at the gait's
+    // phase-0 pattern (Phase A2), so we HOLD that pose statically — ticking the
+    // gait at vx=0 would pull the feet back to the symmetric nominal stance and
+    // re-introduce the startup drag. Without forward motion (vx=0) there is no
+    // pattern to hold, so we fall back to the in-place gait.
     let mut cmd_vel = VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 };
-    ctrl.set_velocity_cmd(cmd_vel);
     for i in 0..ticks(inplace_secs) {
         let sample = poll_state!();
-        let (q, tau) = gait_qtau!();
+        let (q, tau) = match &hold_pose {
+            Some(hp) => (*hp, ZERO_TAU),
+            None => {
+                ctrl.set_velocity_cmd(cmd_vel);
+                gait_qtau!()
+            }
+        };
         emit(&q, &tau, kp, kd)?;
         record(sample.as_ref(), &q, cmd_vel, last_stance, "B", i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
     }
 
-    // Phase C: forward, recording.
+    // Phase C: forward. The gait is still at reset (cycle_phase 0); we command
+    // `vx_target` directly and let the gait's own soft-start ease the body into
+    // motion. Its first tick reproduces `spread` = the placed feet, so there is
+    // no accel-from-zero ramp (that would drag the feet back to nominal).
     if vx_target > 0.0 {
-        let accel_n = ticks(ACCEL_SECS);
-        for i in 0..accel_n {
-            let v = vx_target * (i as f64 / accel_n as f64);
-            cmd_vel = VelocityCmd { vx: v, vy: 0.0, wz: 0.0 };
-            ctrl.set_velocity_cmd(cmd_vel);
-            let sample = poll_state!();
-            let (q, tau) = gait_qtau!();
-            emit(&q, &tau, kp, kd)?;
-            record(sample.as_ref(), &q, cmd_vel, last_stance, "C", b_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
-        }
         cmd_vel = VelocityCmd { vx: vx_target, vy: 0.0, wz: 0.0 };
         ctrl.set_velocity_cmd(cmd_vel);
         for i in 0..ticks(forward_secs) {
             let sample = poll_state!();
             let (q, tau) = gait_qtau!();
             emit(&q, &tau, kp, kd)?;
-            record(sample.as_ref(), &q, cmd_vel, last_stance, "C", b_dur + accel_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
+            record(sample.as_ref(), &q, cmd_vel, last_stance, "C", b_dur + i as f64 * CONTROL_DT, &mut err_sum, &mut err_max, &mut n_rec, &mut roll_max, &mut pitch_max, &mut yaw_first, &mut yaw_dev_max, &mut yaw_last, &mut sample_log, &mut csv)?;
         }
+        // Decelerate to a stop before folding (gait eases back toward nominal).
+        let accel_n = ticks(ACCEL_SECS);
         for i in 0..accel_n {
             let v = vx_target * (1.0 - i as f64 / accel_n as f64);
             cmd_vel = VelocityCmd { vx: v, vy: 0.0, wz: 0.0 };
