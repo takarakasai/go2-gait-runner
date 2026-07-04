@@ -1,0 +1,22 @@
+name: CI
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warning-zero policy: any rustc warning in this repo is a regression.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive # models/unitree_go2 (go2.misa)
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # cyclonedds-sys ships committed bindings + a vendored libddsc,
+      # so a plain check needs no system DDS / libclang.
+      - name: Check (all targets, all features)
+        run: cargo check --all-targets --all-features
