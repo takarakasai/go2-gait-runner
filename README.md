@@ -1,6 +1,6 @@
 # go2-gait-runner
 
-[![CI](https://github.com/takarakasai/go2-gait-runner/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/takarakasai/go2-gait-runner/actions/workflows/ci.yml)
+[![CI](https://github.com/takarakasai/go2-gait-runner/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/takarakasai/go2-gait-runner/actions/workflows/ci.yml) [![coverage](https://codecov.io/gh/takarakasai/go2-gait-runner/graph/badge.svg)](https://codecov.io/gh/takarakasai/go2-gait-runner)
 
 Headless runner that drives the [`quadruped-gait`](https://github.com/takarakasai/articara)
 `LinearCrawl` controller on a **real Unitree Go2** over the low-level
