@@ -77,7 +77,11 @@ go2-gait-runner run eth0 --vx 0.05 --four-support 0.9 --max-swing-speed 3.0
 ## Learned-policy mode (`policy`)
 
 Built with the default `policy` feature, the `policy` subcommand runs an
-exported reinforcement-learning policy (ONNX, via the pure-Rust
+exported reinforcement-learning policy. The policy I/O (observation
+assembly, inference, action mapping, plausibility screen, CSV logging)
+lives in the shared [`policy-runtime`] crate of the quadruped-gait repo —
+articara's MuJoCo sim-deploy drives the identical code, so a sim run
+validates the exact bytes that later run here. (ONNX, via the pure-Rust
 [`tract`](https://github.com/sonos/tract) runtime) in place of the analytic
 LinearCrawl controller. It reuses the same hardware glue (sport-mode release,
 500 Hz `rt/lowcmd`, fold-down on exit); only the joint-target source changes.
