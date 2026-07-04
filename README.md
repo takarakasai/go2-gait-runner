@@ -114,3 +114,35 @@ Teleop: `W/S` or `↑/↓` forward/back, `A/D` strafe, `←/→` turn, `Space` s
 > assumed to match the Go2 SDK directly (no per-joint flip). Before a full run,
 > verify each joint moves in the expected direction at low `--kp` — a flipped
 > sign will destabilize the policy.
+
+### Verifying the policy I/O before a run
+
+Escalate through these stages — each one proves the next layer without
+letting the policy move the robot:
+
+```sh
+# 1. Offline (no robot): model loads, 45 -> 12 shapes, inference latency
+#    (mean/p99 vs the 20 ms slot budget), and a bounded-response probe over
+#    100 plausible random observations (finite actions, limit-clamp count).
+go2-gait-runner policy x --model policy.onnx --selftest
+
+# 2. On robot, no inference: hold the default pose and watch the live obs.
+#    Tilt the robot by hand — level & still must read grav≈[0,0,-1], gyro≈0.
+go2-gait-runner policy eth0 --model policy.onnx --hold --csv hold.csv
+
+# 3. On robot, SHADOW mode: inference runs on the live observation and is
+#    logged, but the motors keep holding the default pose. Check |act|max /
+#    |dq_des|max on the status line and the CSV before ever applying output.
+go2-gait-runner policy eth0 --model policy.onnx --shadow --csv shadow.csv
+
+# 4. Only then: a real run (start with --duration 5 and a hand on the robot).
+go2-gait-runner policy eth0 --model policy.onnx --duration 5 --csv run.csv
+```
+
+Every inference tick can be logged with `--csv PATH` (full 45-d observation,
+12-d action, commanded `q_des`, inference latency, anomaly flags). An
+**observation plausibility screen** runs in all modes and warns live —
+non-finite values, non-unit projected gravity, out-of-range gyro / joint
+offsets / joint velocities — with a per-kind count in the exit summary. The
+obs assembly itself (layout, Isaac reorder, gravity projection vs a nalgebra
+reference) is pinned by unit tests (`cargo test --features policy`).

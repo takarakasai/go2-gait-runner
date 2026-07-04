@@ -189,7 +189,7 @@ struct Cli {
 /// Named flags that act as presence booleans (no value consumed).
 const BOOL_FLAGS: &[&str] = &[
     "ff", "grav-ff", "no-release", "restore", "smooth-swing", "level", "viz", "led-3support",
-    "step-noadvance", "no-keyboard", "selftest", "hold",
+    "step-noadvance", "no-keyboard", "selftest", "hold", "shadow",
 ];
 
 fn parse_cli(args: impl Iterator<Item = String>) -> Cli {
@@ -359,7 +359,11 @@ MODES:
                   Hardware: run an exported RL policy (ONNX) instead of
                   LinearCrawl. release -> stand to default -> 50 Hz inference
                   (kp=25,kd=0.5) -> fold. WASD/arrows teleop (see below).
-                  --selftest loads+runs the model offline (no robot).
+                  --selftest loads+runs the model offline (no robot):
+                  shape, latency budget, bounded-response probe.
+                  Bring-up: --hold (default pose + live obs, no inference),
+                  --shadow (infer + log, never command), --csv PATH (log
+                  obs/action/q_des/latency per inference tick).
   release <iface> Deactivate sport_mode (native RPC; replaces go2_motion_ctrl).
   restore <iface> Re-select \"normal\" so the onboard controller takes over.
   checkmode <iface>  Print the currently active motion mode.
@@ -677,6 +681,13 @@ fn main() {
                 // `--hold`: after standup, HOLD the default pose (no inference)
                 // and print the live observation, to verify obs signs by hand.
                 let hold = cli.flag("hold");
+                // `--shadow`: run inference on the live observation but keep
+                // commanding the default pose — the policy's would-be actions
+                // are only logged (with --csv), never sent to the motors.
+                let shadow = cli.flag("shadow");
+                // `--csv PATH`: log every inference tick (obs, action, q_des,
+                // latency, anomaly flags) for offline verification.
+                let csv_path = cli.str("csv").map(|s| s.to_string());
 
                 if !cli.flag("no-release") {
                     if let Err(e) = motion_release(&iface) {
@@ -687,8 +698,18 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
-                let res =
-                    run_policy(&iface, &model, [vx0, vy0, wz0], kp, kd, keyboard, duration, hold);
+                let res = run_policy(
+                    &iface,
+                    &model,
+                    [vx0, vy0, wz0],
+                    kp,
+                    kd,
+                    keyboard,
+                    duration,
+                    hold,
+                    shadow,
+                    csv_path.as_deref(),
+                );
                 if let Err(e) = res {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -2608,6 +2629,86 @@ fn spawn_keyboard(
 /// Offline model check (`policy ... --selftest`): load the ONNX in tract and run
 /// a few inferences without touching the robot. Validates the file loads, the
 /// 45->12 shape is right, and inference works on this build/arch.
+/// Plausibility screen for a 45-d observation. Returns the (static) names of
+/// every violated check — sign/unit/order mistakes and NaNs show up here long
+/// before they are debuggable from robot behaviour. Thresholds are generous:
+/// anything flagged is *implausible*, not merely unusual.
+///
+/// Layout: [0..3) ang_vel, [3..6) projected gravity (unit), [6..9) cmd,
+/// [9..21) joint_pos−default (Isaac), [21..33) joint_vel, [33..45) last action.
+#[cfg(feature = "policy")]
+fn policy_obs_anomalies(obs: &[f32]) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if obs.len() != 45 {
+        v.push("bad_len");
+        return v;
+    }
+    if obs.iter().any(|x| !x.is_finite()) {
+        v.push("non_finite");
+    }
+    let g_norm = (obs[3] * obs[3] + obs[4] * obs[4] + obs[5] * obs[5]).sqrt();
+    if !(0.7..=1.3).contains(&g_norm) {
+        v.push("gravity_not_unit");
+    }
+    if obs[..3].iter().any(|x| x.abs() > 15.0) {
+        v.push("gyro_out_of_range");
+    }
+    if obs[9..21].iter().any(|x| x.abs() > 1.8) {
+        v.push("joint_pos_offset_large");
+    }
+    if obs[21..33].iter().any(|x| x.abs() > 35.0) {
+        v.push("joint_vel_large");
+    }
+    v
+}
+
+/// CSV header for `--csv`: one row per inference tick, full observation and
+/// action so sign / ordering questions can be settled offline.
+#[cfg(feature = "policy")]
+fn policy_csv_header() -> String {
+    let mut h = String::from("t_s,mode,infer_us");
+    for n in [
+        "ang_vel_x", "ang_vel_y", "ang_vel_z", "grav_x", "grav_y", "grav_z", "cmd_vx",
+        "cmd_vy", "cmd_wz",
+    ] {
+        h.push(',');
+        h.push_str(n);
+    }
+    for p in ["jp_isaac", "jv_isaac", "prev_act", "act", "qdes_go2"] {
+        for i in 0..12 {
+            h.push_str(&format!(",{p}_{i}"));
+        }
+    }
+    h.push_str(",anomalies");
+    h
+}
+
+#[cfg(feature = "policy")]
+fn write_policy_csv_row<W: std::io::Write>(
+    w: &mut W,
+    t_s: f64,
+    mode: &str,
+    infer_us: u128,
+    obs: &[f32],
+    action: &[f64; 12],
+    q_des_go2: &[f64; 12],
+    anomalies: &[&str],
+) -> Result<(), String> {
+    let mut row = format!("{t_s:.4},{mode},{infer_us}");
+    for x in obs {
+        row.push_str(&format!(",{x:.6}"));
+    }
+    for x in action {
+        row.push_str(&format!(",{x:.6}"));
+    }
+    for x in q_des_go2 {
+        row.push_str(&format!(",{x:.6}"));
+    }
+    row.push(',');
+    row.push_str(&anomalies.join("|"));
+    writeln!(w, "{row}").map_err(|e| format!("csv write: {e}"))
+}
+
 #[cfg(feature = "policy")]
 fn policy_selftest(model_path: &str) -> Result<(), String> {
     use tract_onnx::prelude::*;
@@ -2642,6 +2743,104 @@ fn policy_selftest(model_path: &str) -> Result<(), String> {
         let a: Vec<f32> = view.iter().map(|v| (v * 1000.0).round() / 1000.0).collect();
         eprintln!("selftest: action[{label}] = {a:?}");
     }
+    // ── latency: must fit comfortably inside one 50 Hz inference slot ──────
+    let zero_in: Tensor = tract_ndarray::Array2::<f32>::zeros((1, N_OBS)).into();
+    for _ in 0..20 {
+        model
+            .run(tvec!(zero_in.clone().into()))
+            .map_err(|e| format!("warmup: {e}"))?;
+    }
+    let mut lat_us: Vec<u128> = Vec::with_capacity(200);
+    for _ in 0..200 {
+        let t0 = std::time::Instant::now();
+        model
+            .run(tvec!(zero_in.clone().into()))
+            .map_err(|e| format!("bench: {e}"))?;
+        lat_us.push(t0.elapsed().as_micros());
+    }
+    lat_us.sort_unstable();
+    let mean = lat_us.iter().sum::<u128>() as f64 / lat_us.len() as f64;
+    let p99 = lat_us[lat_us.len() * 99 / 100 - 1];
+    let budget_us = (CONTROL_DT * POLICY_DECIMATION as f64 * 1e6) as u128;
+    eprintln!(
+        "selftest: latency mean {mean:.0}us p99 {p99}us max {}us (slot budget {budget_us}us)",
+        lat_us[lat_us.len() - 1]
+    );
+    if p99 > budget_us / 2 {
+        eprintln!(
+            "selftest: WARNING — p99 uses more than half the inference slot; \
+             expect jitter on the Go2's weaker CPU."
+        );
+    }
+
+    // ── bounded-response probe: plausible pseudo-random obs (no rand dep) ──
+    let mut seed = 0x9e3779b97f4a7c15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        // uniform in [-1, 1)
+        (seed >> 11) as f64 / (1u64 << 52) as f64 - 1.0
+    };
+    let mut abs_max = 0.0f64;
+    let mut clamped = 0usize;
+    for _ in 0..100 {
+        let mut obs = vec![0.0f32; N_OBS];
+        for i in 0..3 {
+            obs[i] = (next() * 2.0) as f32; // ang_vel ±2 rad/s
+        }
+        // random unit gravity direction
+        let (gx, gy, gz) = (next(), next(), next() - 1.0);
+        let n = (gx * gx + gy * gy + gz * gz).sqrt().max(1e-9);
+        obs[3] = (gx / n) as f32;
+        obs[4] = (gy / n) as f32;
+        obs[5] = (gz / n) as f32;
+        obs[6] = (next() * CMD_VX_RANGE.1) as f32;
+        obs[7] = (next() * CMD_VY_RANGE.1) as f32;
+        obs[8] = (next() * CMD_WZ_RANGE.1) as f32;
+        for i in 9..21 {
+            obs[i] = (next() * 0.5) as f32; // joint offsets ±0.5 rad
+        }
+        for i in 21..33 {
+            obs[i] = (next() * 3.0) as f32; // joint vel ±3 rad/s
+        }
+        for i in 33..45 {
+            obs[i] = next() as f32; // previous action ±1
+        }
+        let input: Tensor = tract_ndarray::Array2::<f32>::from_shape_vec((1, N_OBS), obs)
+            .map_err(|e| format!("probe shape: {e}"))?
+            .into();
+        let out = model
+            .run(tvec!(input.into()))
+            .map_err(|e| format!("probe: {e}"))?;
+        let view = out[0]
+            .to_array_view::<f32>()
+            .map_err(|e| format!("probe view: {e}"))?;
+        for i in 0..12 {
+            let a = view[[0, i]] as f64;
+            if !a.is_finite() {
+                return Err(format!("probe: non-finite action[{i}]"));
+            }
+            abs_max = abs_max.max(a.abs());
+            let q = DEFAULT_ISAAC[i] + ACTION_SCALE * a;
+            let (lo, hi) = LIMITS[ISAAC_TO_GO2[i] % 3];
+            if q < lo || q > hi {
+                clamped += 1;
+            }
+        }
+    }
+    eprintln!(
+        "selftest: bounded-response probe (100 plausible random obs): \
+         |action|max = {abs_max:.2} ({clamped}/1200 joint targets would hit the \
+         hardware limit clamp)"
+    );
+    if abs_max > 6.0 {
+        eprintln!(
+            "selftest: WARNING — actions exceed 6.0; with ACTION_SCALE {ACTION_SCALE} \
+             that is a large q_des swing. Double-check obs scaling conventions."
+        );
+    }
+
     eprintln!("selftest: OK — model loads and infers (45 -> 12).");
     Ok(())
 }
@@ -2658,6 +2857,8 @@ fn run_policy(
     keyboard: bool,
     duration: Option<f64>,
     hold: bool,
+    shadow: bool,
+    csv_path: Option<&str>,
 ) -> Result<(), String> {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2779,20 +2980,101 @@ fn run_policy(
     let deadline = duration.map(Duration::from_secs_f64);
     let run_start = Instant::now();
     let mut status = Instant::now();
+    // ── verification instrumentation (--csv / obs anomaly screen) ────────────
+    let mode_str = if hold {
+        "hold"
+    } else if shadow {
+        "shadow"
+    } else {
+        "run"
+    };
+    let mut csv = match csv_path {
+        Some(p) => {
+            let mut f = std::fs::File::create(p).map_err(|e| format!("csv {p}: {e}"))?;
+            writeln!(f, "{}", policy_csv_header()).map_err(|e| format!("csv {p}: {e}"))?;
+            eprintln!("policy: logging every inference tick to {p}");
+            Some(f)
+        }
+        None => None,
+    };
+    let mut anomaly_counts: std::collections::BTreeMap<&'static str, u64> =
+        std::collections::BTreeMap::new();
+    let mut last_anomaly_warn: Option<Instant> = None;
+    let mut infer_us: Vec<u128> = Vec::new();
     'run: while !quit.load(Ordering::Relaxed) {
         if let Some(d) = deadline {
             if run_start.elapsed() >= d {
                 break;
             }
         }
-        // newest robot state -> obs -> inference -> joint targets
+        // newest robot state -> obs -> (inference) -> joint targets
         if let Some(st) = reader.poll().map_err(|e| format!("poll: {e}"))? {
             let cmd_now = *cmd.lock().unwrap();
             let obs = build_policy_obs(&st, &cmd_now, &last_action);
-            if hold {
-                // calibration: keep the default pose, just surface the obs so the
-                // operator can verify observation signs by tilting the robot.
+            // Plausibility screen: catch sign/unit/order mistakes (and NaNs)
+            // before they reach the network, and count them for the summary.
+            let anomalies = policy_obs_anomalies(&obs);
+            if !anomalies.is_empty() {
+                for a in &anomalies {
+                    *anomaly_counts.entry(a).or_insert(0) += 1;
+                }
+                let due = last_anomaly_warn
+                    .map(|t| t.elapsed().as_secs_f64() > 1.0)
+                    .unwrap_or(true);
+                if due {
+                    eprintln!("\rpolicy: OBS ANOMALY: {}", anomalies.join(", "));
+                    last_anomaly_warn = Some(Instant::now());
+                }
+            }
+            let mut action_isaac = [0.0f64; 12];
+            let mut tick_us = 0u128;
+            if !hold {
+                // shadow and run both infer; only run applies the result.
+                let t0 = Instant::now();
+                let input: Tensor = tract_ndarray::Array2::<f32>::from_shape_vec((1, N_OBS), obs.clone())
+                    .map_err(|e| format!("obs shape: {e}"))?
+                    .into();
+                let out = model
+                    .run(tvec!(input.into()))
+                    .map_err(|e| format!("inference: {e}"))?;
+                let view = out[0]
+                    .to_array_view::<f32>()
+                    .map_err(|e| format!("output view: {e}"))?;
+                tick_us = t0.elapsed().as_micros();
+                infer_us.push(tick_us);
+                for i in 0..12 {
+                    action_isaac[i] = view[[0, i]] as f64;
+                }
+                last_action = action_isaac;
+            }
+            if hold || shadow {
+                // Never command the policy output: hold the default pose. The
+                // would-be actions still land in the CSV / status line.
                 q_des_go2 = default_go2;
+            } else {
+                // q_des = default + scale*action (Isaac), reorder to Go2, clamp to limits
+                for i in 0..12 {
+                    let q_isaac = DEFAULT_ISAAC[i] + ACTION_SCALE * action_isaac[i];
+                    let g = ISAAC_TO_GO2[i];
+                    let (lo, hi) = LIMITS[g % 3];
+                    q_des_go2[g] = q_isaac.clamp(lo, hi);
+                }
+            }
+            if let Some(f) = csv.as_mut() {
+                write_policy_csv_row(
+                    f,
+                    run_start.elapsed().as_secs_f64(),
+                    mode_str,
+                    tick_us,
+                    &obs,
+                    &action_isaac,
+                    &q_des_go2,
+                    &anomalies,
+                )?;
+            }
+            if hold {
+                // calibration: surface the obs so the operator can verify
+                // observation signs by tilting the robot.
                 if status.elapsed().as_secs_f64() > 0.3 {
                     eprint!(
                         "\rHOLD obs: ang_vel=[{:+.2},{:+.2},{:+.2}] \
@@ -2804,41 +3086,34 @@ fn run_policy(
                     let _ = std::io::stderr().flush();
                     status = Instant::now();
                 }
-            } else {
-                let input: Tensor = tract_ndarray::Array2::<f32>::from_shape_vec((1, N_OBS), obs)
-                    .map_err(|e| format!("obs shape: {e}"))?
-                    .into();
-                let out = model
-                    .run(tvec!(input.into()))
-                    .map_err(|e| format!("inference: {e}"))?;
-                let view = out[0]
-                    .to_array_view::<f32>()
-                    .map_err(|e| format!("output view: {e}"))?;
-                let mut action_isaac = [0.0f64; 12];
-                for i in 0..12 {
-                    action_isaac[i] = view[[0, i]] as f64;
-                }
-                last_action = action_isaac;
-                // q_des = default + scale*action (Isaac), reorder to Go2, clamp to limits
-                for i in 0..12 {
-                    let q_isaac = DEFAULT_ISAAC[i] + ACTION_SCALE * action_isaac[i];
-                    let g = ISAAC_TO_GO2[i];
-                    let (lo, hi) = LIMITS[g % 3];
-                    q_des_go2[g] = q_isaac.clamp(lo, hi);
-                }
-                if status.elapsed().as_secs_f64() > 0.5 {
-                    let rpy = st.imu_state.rpy;
+            } else if shadow {
+                if status.elapsed().as_secs_f64() > 0.3 {
+                    // headline numbers for "would the policy do something sane?"
+                    let a_max = action_isaac.iter().fold(0.0f64, |m, a| m.max(a.abs()));
+                    let dq_max = (0..12)
+                        .map(|i| (ACTION_SCALE * action_isaac[i]).abs())
+                        .fold(0.0f64, f64::max);
                     eprint!(
-                        "\rpolicy: cmd vx={:+.2} vy={:+.2} wz={:+.2}  pitch={:+.1}deg roll={:+.1}deg   ",
-                        cmd_now[0],
-                        cmd_now[1],
-                        cmd_now[2],
-                        (rpy[1] as f64).to_degrees(),
-                        (rpy[0] as f64).to_degrees()
+                        "\rSHADOW cmd=[{:+.2},{:+.2},{:+.2}] |act|max={:.2} \
+                         |dq_des|max={:.2}rad infer={}us grav=[{:+.2},{:+.2},{:+.2}]   ",
+                        cmd_now[0], cmd_now[1], cmd_now[2], a_max, dq_max, tick_us,
+                        obs[3], obs[4], obs[5],
                     );
                     let _ = std::io::stderr().flush();
                     status = Instant::now();
                 }
+            } else if status.elapsed().as_secs_f64() > 0.5 {
+                let rpy = st.imu_state.rpy;
+                eprint!(
+                    "\rpolicy: cmd vx={:+.2} vy={:+.2} wz={:+.2}  pitch={:+.1}deg roll={:+.1}deg   ",
+                    cmd_now[0],
+                    cmd_now[1],
+                    cmd_now[2],
+                    (rpy[1] as f64).to_degrees(),
+                    (rpy[0] as f64).to_degrees()
+                );
+                let _ = std::io::stderr().flush();
+                status = Instant::now();
             }
         }
         // hold the target for POLICY_DECIMATION control ticks
@@ -2852,6 +3127,32 @@ fn run_policy(
                 }
             }
             emit(&q_des_go2, kp, kd)?;
+        }
+    }
+
+    // ── verification summary ──────────────────────────────────────────────────
+    if !infer_us.is_empty() {
+        let mut v = infer_us.clone();
+        v.sort_unstable();
+        let mean = v.iter().sum::<u128>() as f64 / v.len() as f64;
+        let p99 = v[(v.len() * 99 / 100).min(v.len() - 1)];
+        let budget_us = (CONTROL_DT * POLICY_DECIMATION as f64 * 1e6) as u128;
+        eprintln!(
+            "\npolicy: inference latency over {} ticks: mean {:.0}us p99 {}us max {}us \
+             (budget {}us/slot)",
+            v.len(),
+            mean,
+            p99,
+            v[v.len() - 1],
+            budget_us
+        );
+    }
+    if anomaly_counts.is_empty() {
+        eprintln!("policy: obs plausibility screen: no anomalies.");
+    } else {
+        eprintln!("policy: OBS ANOMALIES seen:");
+        for (k, n) in &anomaly_counts {
+            eprintln!("  {k}: {n} ticks");
         }
     }
 
@@ -3116,4 +3417,173 @@ mod tests {
         // The chosen pose must be a plausible joint vector (within limits-ish).
         assert!(q.iter().all(|v| v.abs() < 3.5), "q out of range: {q:?} (tick {tick})");
     }
+
+    // ── ONNX policy I/O plumbing (feature = "policy") ──
+    //
+    // Hardware-verification groundwork: pin the observation layout, the
+    // Isaac<->Go2 reorder, the gravity projection (cross-checked against
+    // nalgebra as a reference implementation), and the plausibility screen,
+    // so an on-robot anomaly points at the robot/IMU, not at this code.
+    #[cfg(feature = "policy")]
+    mod policy_tests {
+        use super::super::*;
+        use unitree_go2::LowState;
+
+        #[test]
+        fn obs_layout_default_state() {
+            let st = LowState::default();
+            let cmd = [0.1, -0.2, 0.3];
+            let mut last = [0.0f64; 12];
+            last[0] = 0.5;
+            last[11] = -0.5;
+            let obs = build_policy_obs(&st, &cmd, &last);
+            assert_eq!(obs.len(), 45);
+            // gyro zeros
+            assert_eq!(&obs[..3], &[0.0, 0.0, 0.0]);
+            // zero quaternion hits the gz = 2(x²+y²)−1 = −1 branch: [0,0,−1]
+            assert_eq!(&obs[3..6], &[0.0, 0.0, -1.0]);
+            // command passthrough
+            assert!((obs[6] - 0.1).abs() < 1e-6);
+            assert!((obs[7] + 0.2).abs() < 1e-6);
+            assert!((obs[8] - 0.3).abs() < 1e-6);
+            // q = 0 ⇒ joint-pos slice is −default (Isaac order)
+            for i in 0..12 {
+                assert!(
+                    (obs[9 + i] as f64 + DEFAULT_ISAAC[i]).abs() < 1e-6,
+                    "jp[{i}]"
+                );
+                assert_eq!(obs[21 + i], 0.0, "jv[{i}]");
+            }
+            // last_action passthrough (Isaac order)
+            assert!((obs[33] - 0.5).abs() < 1e-6);
+            assert!((obs[44] + 0.5).abs() < 1e-6);
+        }
+
+        #[test]
+        fn isaac_go2_tables_are_mutual_inverses() {
+            for g in 0..12 {
+                assert_eq!(ISAAC_TO_GO2[GO2_TO_ISAAC[g]], g, "go2 {g}");
+            }
+            for i in 0..12 {
+                assert_eq!(GO2_TO_ISAAC[ISAAC_TO_GO2[i]], i, "isaac {i}");
+            }
+        }
+
+        #[test]
+        fn joint_reorder_lands_each_motor_in_its_isaac_slot() {
+            let mut st = LowState::default();
+            // Give each motor a unique angle = its own default + g*0.01 so the
+            // subtraction leaves a recognisable residue in the Isaac slot.
+            for g in 0..12 {
+                st.motor_state[g].q =
+                    (DEFAULT_ISAAC[GO2_TO_ISAAC[g]] + g as f64 * 0.01) as f32;
+                st.motor_state[g].dq = g as f32;
+            }
+            let obs = build_policy_obs(&st, &[0.0; 3], &[0.0; 12]);
+            for g in 0..12 {
+                let i = GO2_TO_ISAAC[g];
+                assert!(
+                    (obs[9 + i] as f64 - g as f64 * 0.01).abs() < 1e-5,
+                    "jp motor {g} -> isaac {i}"
+                );
+                assert!((obs[21 + i] as f64 - g as f64).abs() < 1e-6, "jv {g}");
+            }
+        }
+
+        #[test]
+        fn gravity_projection_matches_nalgebra_reference() {
+            use nalgebra::{Quaternion, UnitQuaternion, Vector3};
+            // (w, x, y, z) — identity, 90° about each axis, and two arbitrary.
+            let quats = [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.7071068, 0.7071068, 0.0, 0.0],
+                [0.7071068, 0.0, 0.7071068, 0.0],
+                [0.7071068, 0.0, 0.0, 0.7071068],
+                [0.4, 0.3, 0.5, 0.2],
+                [-0.6, 0.1, -0.2, 0.5],
+            ];
+            for q in quats {
+                let mut st = LowState::default();
+                let n = (q.iter().map(|v| v * v).sum::<f64>()).sqrt();
+                for k in 0..4 {
+                    st.imu_state.quaternion[k] = (q[k] / n) as f32;
+                }
+                let obs = build_policy_obs(&st, &[0.0; 3], &[0.0; 12]);
+                let uq = UnitQuaternion::from_quaternion(Quaternion::new(
+                    q[0], q[1], q[2], q[3],
+                ));
+                let g_ref = uq.inverse_transform_vector(&Vector3::new(0.0, 0.0, -1.0));
+                for k in 0..3 {
+                    assert!(
+                        (obs[3 + k] as f64 - g_ref[k]).abs() < 1e-5,
+                        "quat {q:?} axis {k}: got {} want {}",
+                        obs[3 + k],
+                        g_ref[k]
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn clamp_cmd_applies_trained_ranges() {
+            let c = clamp_cmd([10.0, -10.0, 10.0]);
+            assert_eq!(c, [CMD_VX_RANGE.1, CMD_VY_RANGE.0, CMD_WZ_RANGE.1]);
+            let c = clamp_cmd([0.1, 0.1, -0.1]);
+            assert_eq!(c, [0.1, 0.1, -0.1]);
+        }
+
+        #[test]
+        fn obs_anomaly_screen_flags_the_right_things() {
+            // A default LowState produces a clean observation.
+            let clean = build_policy_obs(&LowState::default(), &[0.0; 3], &[0.0; 12]);
+            assert!(policy_obs_anomalies(&clean).is_empty());
+
+            let mut o = clean.clone();
+            o[10] = f32::NAN;
+            assert!(policy_obs_anomalies(&o).contains(&"non_finite"));
+
+            let mut o = clean.clone();
+            o[3] = 0.0;
+            o[4] = 0.0;
+            o[5] = -0.2; // |g| far from 1
+            assert!(policy_obs_anomalies(&o).contains(&"gravity_not_unit"));
+
+            let mut o = clean.clone();
+            o[1] = 100.0;
+            assert!(policy_obs_anomalies(&o).contains(&"gyro_out_of_range"));
+
+            let mut o = clean.clone();
+            o[25] = 100.0;
+            assert!(policy_obs_anomalies(&o).contains(&"joint_vel_large"));
+
+            assert_eq!(policy_obs_anomalies(&[0.0; 3]), vec!["bad_len"]);
+        }
+
+        #[test]
+        fn csv_row_matches_header_width() {
+            let header = policy_csv_header();
+            let cols = header.split(',').count();
+            // 3 fixed + 45 obs + 12 act + 12 q_des + 1 anomalies
+            assert_eq!(cols, 3 + 45 + 12 + 12 + 1);
+
+            let obs = build_policy_obs(&LowState::default(), &[0.0; 3], &[0.0; 12]);
+            let mut buf: Vec<u8> = Vec::new();
+            write_policy_csv_row(
+                &mut buf,
+                1.25,
+                "shadow",
+                123,
+                &obs,
+                &[0.0; 12],
+                &[0.0; 12],
+                &["gyro_out_of_range"],
+            )
+            .unwrap();
+            let row = String::from_utf8(buf).unwrap();
+            assert_eq!(row.trim_end().split(',').count(), cols);
+            assert!(row.starts_with("1.2500,shadow,123,"));
+            assert!(row.trim_end().ends_with("gyro_out_of_range"));
+        }
+    }
 }
+
