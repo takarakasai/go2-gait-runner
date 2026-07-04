@@ -2359,3 +2359,240 @@ fn run_hardware(
     eprintln!("done: gait complete, folded on the ground.");
     Ok(())
 }
+
+// ─── Unit tests ─────────────────────────────────────────────────────────────
+//
+// Pure-logic coverage for the pieces that hurt most when they regress on
+// hardware: the jerk-limited transient profile, the gait→Go2 joint mapping,
+// CLI parsing, and (against the real go2.misa) the Phase A start-pose
+// leveling and the Phase A2 alignment probe. No DDS / hardware involved.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GO2_MISA: &str = "models/unitree_go2/go2.misa";
+
+    fn crawl_tune() -> GaitTune {
+        GaitTune {
+            swing_h: 0.06,
+            cycle_s: None,
+            four_support: None,
+            sway: None,
+            smooth_swing: false,
+            stance_width: None,
+            max_swing_foot_speed: None,
+            stance_height: 0.35,
+            gait_mode: GaitMode::LinearCrawl,
+            gait_type: GaitType::Crawl,
+        }
+    }
+
+    // ── smootherstep (jerk-limited transient) ──
+
+    #[test]
+    fn smootherstep_endpoints_mid_and_clamp() {
+        assert_eq!(smootherstep(0.0), 0.0);
+        assert_eq!(smootherstep(1.0), 1.0);
+        assert!((smootherstep(0.5) - 0.5).abs() < 1e-12);
+        // Out-of-range input clamps instead of extrapolating.
+        assert_eq!(smootherstep(-3.0), 0.0);
+        assert_eq!(smootherstep(7.0), 1.0);
+    }
+
+    #[test]
+    fn smootherstep_is_monotone_with_rest_to_rest_ends() {
+        let mut prev = 0.0;
+        for i in 1..=1000 {
+            let v = smootherstep(i as f64 / 1000.0);
+            assert!(v >= prev, "not monotone at {i}");
+            prev = v;
+        }
+        // Zero 1st and 2nd derivative at both ends (finite differences).
+        let h = 1e-3;
+        let d0 = (smootherstep(h) - smootherstep(0.0)) / h;
+        let d1 = (smootherstep(1.0) - smootherstep(1.0 - h)) / h;
+        assert!(d0.abs() < 1e-4, "start velocity {d0}");
+        assert!(d1.abs() < 1e-4, "end velocity {d1}");
+        let dd0 = (smootherstep(2.0 * h) - 2.0 * smootherstep(h) + smootherstep(0.0)) / (h * h);
+        let dd1 = (smootherstep(1.0) - 2.0 * smootherstep(1.0 - h)
+            + smootherstep(1.0 - 2.0 * h))
+            / (h * h);
+        assert!(dd0.abs() < 1e-1, "start accel {dd0}");
+        assert!(dd1.abs() < 1e-1, "end accel {dd1}");
+    }
+
+    // ── gait → Go2 joint mapping ──
+
+    #[test]
+    fn motor_index_covers_all_twelve_joints() {
+        // Go2 hardware order: FR(0..2), FL(3..5), RR(6..8), RL(9..11).
+        let expect = [
+            ("FR_hip_joint", 0), ("FR_thigh_joint", 1), ("FR_calf_joint", 2),
+            ("FL_hip_joint", 3), ("FL_thigh_joint", 4), ("FL_calf_joint", 5),
+            ("RR_hip_joint", 6), ("RR_thigh_joint", 7), ("RR_calf_joint", 8),
+            ("RL_hip_joint", 9), ("RL_thigh_joint", 10), ("RL_calf_joint", 11),
+        ];
+        for (name, idx) in expect {
+            assert_eq!(go2_motor_index(name), Some(idx), "{name}");
+        }
+        assert_eq!(go2_motor_index("XX_hip_joint"), None);
+        assert_eq!(go2_motor_index("FL_ankle_joint"), None);
+    }
+
+    #[test]
+    fn canonical_slot_bases_match_motor_index() {
+        // CANON_TO_GO2_BASE is FL/FR/RL/RR → Go2 base; must agree with the
+        // name-based mapping.
+        for (slot, prefix) in ["FL", "FR", "RL", "RR"].iter().enumerate() {
+            let name = format!("{prefix}_hip_joint");
+            assert_eq!(
+                go2_motor_index(&name),
+                Some(CANON_TO_GO2_BASE[slot]),
+                "slot {slot} ({prefix})"
+            );
+            assert_eq!(gait_slot(&name), Some(slot), "gait_slot {prefix}");
+        }
+    }
+
+    // ── CLI parsing ──
+
+    #[test]
+    fn cli_flags_values_and_booleans() {
+        let cli = parse_cli(
+            ["run", "eth0", "--vx", "0.05", "--kp=500", "--viz", "--ff", "--vy", "0.01"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(cli.positionals, vec!["run".to_string(), "eth0".to_string()]);
+        assert_eq!(cli.f64("vx"), Some(0.05));
+        assert_eq!(cli.f64("kp"), Some(500.0));
+        assert_eq!(cli.f64("vy"), Some(0.01));
+        // BOOL_FLAGS never consume the next token.
+        assert!(cli.flag("viz"));
+        assert!(cli.flag("ff"));
+        assert!(!cli.flag("level"));
+        assert_eq!(cli.str("nope"), None);
+    }
+
+    #[test]
+    fn cli_trailing_flag_and_parse_flag_forms() {
+        // A non-bool flag followed by another flag (or end) stores "true".
+        let cli = parse_cli(["--csv", "--vx", "0.1"].into_iter().map(String::from));
+        assert!(cli.flag("csv"));
+        assert_eq!(cli.f64("vx"), Some(0.1));
+        for s in ["1", "on", "true", "yes", "y", "ff"] {
+            assert!(parse_flag(s), "{s}");
+        }
+        for s in ["0", "off", "false", "no", ""] {
+            assert!(!parse_flag(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn qdist2_is_squared_euclidean() {
+        let a = [0.0; 12];
+        let mut b = [0.0; 12];
+        assert_eq!(qdist2(&a, &b), 0.0);
+        b[0] = 3.0;
+        b[11] = 4.0;
+        assert!((qdist2(&a, &b) - 25.0).abs() < 1e-12);
+    }
+
+    // ── output_to_go2 against a live controller ──
+
+    #[test]
+    fn output_to_go2_applies_order_and_signs() {
+        let (_m, _hq, mut ctrl, _sg) =
+            build_gait(GO2_MISA, crawl_tune()).expect("go2.misa must build");
+        let out = ctrl.tick(CONTROL_DT);
+        // Alternating signs exercise the per-joint multiply.
+        let mut signs = [[1.0f64; 3]; 4];
+        signs[0] = [-1.0, 1.0, -1.0];
+        signs[3] = [1.0, -1.0, 1.0];
+        let q = output_to_go2(&out, &signs).expect("mappable joint names");
+        for (name, q_ik) in out.iter_joint_targets() {
+            let slot = gait_slot(name).unwrap();
+            let k = joint_kind(name).unwrap();
+            let mi = go2_motor_index(name).unwrap();
+            assert!(
+                (q[mi] - q_ik * signs[slot][k]).abs() < 1e-12,
+                "{name} -> motor {mi}"
+            );
+        }
+    }
+
+    // ── Phase A leveling against the real go2.misa ──
+
+    #[test]
+    fn level_start_keeps_xy_and_adopts_stance_height() {
+        let parsed = misarta::native::load(GO2_MISA).expect("load go2.misa");
+        let (model, _vis, _col) = misarta::native::build_model(&parsed.file).expect("build");
+        let home_q = build_home_q(&model);
+        let kin = auto_detect_kinematics_config(&model, &DEFAULT_FOOT_LINKS, &home_q)
+            .expect("autodetect");
+        let signs = joint_signs(&model, &kin).expect("signs");
+
+        // Reference stance: the home pose in Go2 motor order.
+        let mut stance = [0.0f64; 12];
+        for slot in 0..4 {
+            let base = CANON_TO_GO2_BASE[slot];
+            stance[base] = HOME_HIP;
+            stance[base + 1] = HOME_THIGH;
+            stance[base + 2] = HOME_CALF;
+        }
+        // Start pose: same feet, body 3 cm lower (feet 3 cm less deep).
+        let mut start = stance;
+        for slot in 0..4 {
+            let lk = kin.leg(LegId::ALL[slot]);
+            let base = CANON_TO_GO2_BASE[slot];
+            let p = foot_body_of(lk, &stance, base, &signs[slot]);
+            ik_into(
+                &mut start,
+                lk,
+                nalgebra::Vector3::new(p.x, p.y, p.z + 0.03),
+                base,
+                &signs[slot],
+            );
+        }
+
+        let leveled = level_start_to_stance_height(&start, &stance, &kin, &signs);
+        for slot in 0..4 {
+            let lk = kin.leg(LegId::ALL[slot]);
+            let base = CANON_TO_GO2_BASE[slot];
+            let p_start = foot_body_of(lk, &start, base, &signs[slot]);
+            let p_stance = foot_body_of(lk, &stance, base, &signs[slot]);
+            let p_level = foot_body_of(lk, &leveled, base, &signs[slot]);
+            // Horizontal foot position stays where the operator put it…
+            assert!((p_level.x - p_start.x).abs() < 1e-6, "slot {slot} x");
+            assert!((p_level.y - p_start.y).abs() < 1e-6, "slot {slot} y");
+            // …while the height snaps to the stance profile.
+            assert!((p_level.z - p_stance.z).abs() < 1e-6, "slot {slot} z");
+        }
+    }
+
+    // ── Phase A2 alignment probe ──
+
+    #[test]
+    fn pick_start_alignment_short_circuits_without_forward_speed() {
+        // vx <= 0 returns before the model is even loaded.
+        let r = pick_start_alignment("no/such/file.misa", crawl_tune(), &[[1.0; 3]; 4], &[0.0; 12], 0.0);
+        assert!(matches!(r, Ok(None)));
+    }
+
+    #[test]
+    fn pick_start_alignment_finds_an_all_stance_window() {
+        let parsed = misarta::native::load(GO2_MISA).expect("load go2.misa");
+        let (model, _vis, _col) = misarta::native::build_model(&parsed.file).expect("build");
+        let home_q = build_home_q(&model);
+        let kin = auto_detect_kinematics_config(&model, &DEFAULT_FOOT_LINKS, &home_q)
+            .expect("autodetect");
+        let signs = joint_signs(&model, &kin).expect("signs");
+
+        let r = pick_start_alignment(GO2_MISA, crawl_tune(), &signs, &[0.0; 12], 0.03)
+            .expect("probe run");
+        let (tick, q, cost) = r.expect("crawl has all-stance windows");
+        assert!(cost.is_finite() && cost >= 0.0);
+        // The chosen pose must be a plausible joint vector (within limits-ish).
+        assert!(q.iter().all(|v| v.abs() < 3.5), "q out of range: {q:?} (tick {tick})");
+    }
+}
