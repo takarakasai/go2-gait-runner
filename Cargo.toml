@@ -1,5 +1,5 @@
 # Self-contained: dependencies are fetched from GitHub, no sibling checkout
-# required. `quadruped-gait` comes from the `articara` repo; `misarta` is its
+# required. `quadruped-gait` comes from its own repo; `misarta` is its
 # own standalone repo (https://github.com/takarakasai/misarta.git) — the same
 # git source `quadruped-gait` and `articara` use, so the shared `misarta` type
 # unifies (cargo identifies a git source by its literal URL, so the `https://`
@@ -15,7 +15,7 @@ publish = false
 description = "Headless CLI to run articara/quadruped-gait controllers on a real Unitree Go2 — low-level rt/lowcmd at 500 Hz via unitree-sdk-rs."
 
 [dependencies]
-quadruped-gait = { git = "https://github.com/takarakasai/articara.git", package = "quadruped-gait" }
+quadruped-gait = { git = "https://github.com/takarakasai/quadruped-gait.git" }
 misarta = { git = "https://github.com/takarakasai/misarta.git" }
 unitree-go2 = { git = "https://github.com/takarakasai/unitree-sdk-rs.git", package = "unitree-go2" }
 unitree-rpc = { git = "https://github.com/takarakasai/unitree-sdk-rs.git", package = "unitree-rpc" }
