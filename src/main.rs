@@ -59,6 +59,18 @@ mod viz_pub {
     /// Same mapping as `leg_base_motor`, indexed by gait slot.
     const SLOT_BASE_MOTOR: [usize; 4] = [3, 0, 9, 6];
 
+    /// What the robot reports back this tick: joint angles in **Go2 motor
+    /// order** and the estimated body pose `[x, y, z, yaw]` (metres, radians).
+    ///
+    /// The pose is genuine odometry, not the plan: `x`/`y` come from the stance
+    /// -foot integration in `BodyObserver`, `z` from stance-leg FK and `yaw`
+    /// from the IMU. Roll and pitch are measured too but have nowhere to go —
+    /// the wire format's pose is `[x, y, z, yaw]`.
+    pub struct MeasuredState {
+        pub q: [f64; 12],
+        pub pose: [f64; 4],
+    }
+
     /// Frames queued for the publisher thread. Bounded, so a stalled network
     /// can't grow without limit; `try_send` drops instead of blocking, which is
     /// the right trade for a lossy latest-wins visualization channel.
@@ -161,19 +173,20 @@ mod viz_pub {
         /// convention — exactly what `output_to_go2` sends to the robot — so a
         /// viewer setting `joint_positions` directly renders the *commanded*
         /// pose (e.g. knees bend `<<`, not the IK-sign-flipped `>>`).
-        /// `q_meas` is the last read-back joint vector in **Go2 motor order**
-        /// (`LowState.motor_state[].q`, already in the model convention); when
-        /// given — and a measured key is set — a second frame carrying it is
-        /// published on that key, same tick, same `seq`, same trunk pose, so a
-        /// viewer can superimpose the commanded pose on the measured one and
-        /// only the joint angles differ.
+        /// `meas` is the last read-back state; when given — and a measured key
+        /// is set — a second frame carrying it is published on that key, same
+        /// tick, same `seq`, so a viewer can superimpose command and response.
+        /// Its joints are re-ordered from Go2 motor order into the frame's
+        /// slots (already in the model convention, so no sign correction), and
+        /// its body pose is the measured one, not the commanded one — a viewer
+        /// that wants the two bodies to coincide re-anchors on its side.
         pub fn publish(
             &mut self,
             t_s: f64,
             trunk_z: f64,
             out: &ControllerOutput,
             signs: &[[f64; 3]; 4],
-            q_meas: Option<&[f64; 12]>,
+            meas: Option<&MeasuredState>,
         ) {
             self.since += 1;
             if self.since < self.period {
@@ -186,15 +199,16 @@ mod viz_pub {
                     frame.joints[3 * slot + k] *= signs[slot][k];
                 }
             }
-            if let (Some(q), Some(key)) = (q_meas, self.key_measured().map(str::to_string)) {
-                let mut meas = frame.clone();
+            if let (Some(m), Some(key)) = (meas, self.key_measured().map(str::to_string)) {
+                let mut frame_meas = frame.clone();
                 for slot in 0..4 {
                     let base = SLOT_BASE_MOTOR[slot];
                     for k in 0..3 {
-                        meas.joints[3 * slot + k] = q[base + k];
+                        frame_meas.joints[3 * slot + k] = m.q[base + k];
                     }
                 }
-                self.hand_off(key, meas);
+                frame_meas.pose = m.pose;
+                self.hand_off(key, frame_meas);
             }
             self.seq += 1;
             let key = self.key.clone();
@@ -1828,6 +1842,33 @@ fn foot_body_of(lk: &quadruped_gait::LegKinematics, q: &[f64; 12], base: usize, 
     quadruped_gait::forward_leg_kinematics(lk, q[base] * sg[0], q[base + 1] * sg[1], q[base + 2] * sg[2])
 }
 
+/// Estimated trunk height above the ground from the **measured** joint angles:
+/// a planted foot is on the ground, so the body sits `-p_foot.z` above it.
+/// Averaged over the stance legs; `None` when nothing is planted (flight, or
+/// before the first contact schedule), leaving the caller its own fallback.
+///
+/// Unlike the horizontal odometry this is a direct kinematic reading with no
+/// integration, so it does not drift — a trunk sagging under load shows up here
+/// honestly.
+fn measured_trunk_z(
+    q: &[f64; 12],
+    kin: &quadruped_gait::KinematicsConfig,
+    signs: &[[f64; 3]; 4],
+    stance: &[bool; 4],
+) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut n = 0u32;
+    for slot in 0..4 {
+        if !stance[slot] {
+            continue;
+        }
+        let lk = kin.leg(LegId::ALL[slot]);
+        sum += -foot_body_of(lk, q, CANON_TO_GO2_BASE[slot], &signs[slot]).z;
+        n += 1;
+    }
+    (n > 0).then(|| sum / n as f64)
+}
+
 /// Solve IK for a body-frame foot target and write the three resulting angles
 /// into `q` at `base`, in Go2-motor convention (`q_motor = q_ik · sign`). The
 /// closest reachable configuration is used if the target is just outside the
@@ -2504,7 +2545,20 @@ fn run_hardware(
             {
                 viz_t += CONTROL_DT;
                 if let Some(v) = viz.as_mut() {
-                    v.publish(viz_t, viz_trunk_z, &out, &signs, last_q_meas.as_ref());
+                    // Measured body pose: horizontal from the stance-foot
+                    // odometry the observer already integrates, height from
+                    // stance-leg FK, heading from the IMU.
+                    let meas = last_q_meas.map(|q| viz_pub::MeasuredState {
+                        q,
+                        pose: [
+                            observer.pos.x,
+                            observer.pos.y,
+                            measured_trunk_z(&q, &kin_obs, &signs, &last_stance)
+                                .unwrap_or(viz_trunk_z),
+                            last_rpy[2],
+                        ],
+                    });
+                    v.publish(viz_t, viz_trunk_z, &out, &signs, meas.as_ref());
                 }
             }
             let mut q = output_to_go2(&out, &signs)?;
