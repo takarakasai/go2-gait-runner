@@ -63,12 +63,14 @@ mod viz_pub {
     /// order** and the estimated body pose `[x, y, z, yaw]` (metres, radians).
     ///
     /// The pose is genuine odometry, not the plan: `x`/`y` come from the stance
-    /// -foot integration in `BodyObserver`, `z` from stance-leg FK and `yaw`
-    /// from the IMU. Roll and pitch are measured too but have nowhere to go —
-    /// the wire format's pose is `[x, y, z, yaw]`.
+    /// -foot integration in `BodyObserver`, `z` from stance-leg FK, and the
+    /// attitude straight from the IMU.
     pub struct MeasuredState {
         pub q: [f64; 12],
         pub pose: [f64; 4],
+        /// Trunk roll and pitch (rad) — the tilt the gait plans away and the
+        /// robot does not always deliver.
+        pub pose_rp: [f64; 2],
     }
 
     /// Frames queued for the publisher thread. Bounded, so a stalled network
@@ -208,6 +210,7 @@ mod viz_pub {
                     }
                 }
                 frame_meas.pose = m.pose;
+                frame_meas.pose_rp = m.pose_rp;
                 self.hand_off(key, frame_meas);
             }
             self.seq += 1;
@@ -2557,6 +2560,7 @@ fn run_hardware(
                                 .unwrap_or(viz_trunk_z),
                             last_rpy[2],
                         ],
+                        pose_rp: [last_rpy[0], last_rpy[1]],
                     });
                     v.publish(viz_t, viz_trunk_z, &out, &signs, meas.as_ref());
                 }

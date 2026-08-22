@@ -693,7 +693,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -777,7 +777,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1911,9 +1911,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "misa-wbc"
+version = "0.1.0"
+source = "git+https://github.com/takarakasai/misa-wbc.git#92e42a59af30edca053ce9b61c7a74c40568753b"
+dependencies = [
+ "clarabel",
+ "nalgebra",
+]
+
+[[package]]
 name = "misarta"
 version = "0.1.0"
-source = "git+https://github.com/takarakasai/misarta.git#f89d88c1e7dc99ee54b0af2db2de4597241c5282"
+source = "git+https://github.com/takarakasai/misarta.git#5f677580c460cb1b83203fd71ce31e6c83f39478"
 dependencies = [
  "clarabel",
  "nalgebra",
@@ -2037,7 +2046,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2426,7 +2435,7 @@ dependencies = [
 [[package]]
 name = "policy-runtime"
 version = "0.1.0"
-source = "git+https://github.com/takarakasai/quadruped-gait.git#779e15dc17fb036948fdf8b76b6727ccfe9912bf"
+source = "git+https://github.com/takarakasai/quadruped-gait.git#1500accd26759c3167d90104121c1608659e1f2d"
 dependencies = [
  "tract-onnx",
 ]
@@ -2533,10 +2542,11 @@ dependencies = [
 [[package]]
 name = "quadruped-gait"
 version = "0.1.0"
-source = "git+https://github.com/takarakasai/quadruped-gait.git#779e15dc17fb036948fdf8b76b6727ccfe9912bf"
+source = "git+https://github.com/takarakasai/quadruped-gait.git#1500accd26759c3167d90104121c1608659e1f2d"
 dependencies = [
  "clarabel",
  "log",
+ "misa-wbc",
  "misarta",
  "nalgebra",
  "serde",
@@ -2907,7 +2917,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2974,7 +2984,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3399,7 +3409,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4477,7 +4487,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
