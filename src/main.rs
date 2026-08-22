@@ -48,6 +48,8 @@ struct VizCfg {
 /// errors are ignored so visualization can never disturb the control loop.
 #[cfg(feature = "viz")]
 mod viz_pub {
+    use std::sync::mpsc::{sync_channel, SyncSender};
+
     use quadruped_gait::viz::GaitVizFrame;
     use quadruped_gait::ControllerOutput;
     use zenoh::Wait;
@@ -57,14 +59,25 @@ mod viz_pub {
     /// Same mapping as `leg_base_motor`, indexed by gait slot.
     const SLOT_BASE_MOTOR: [usize; 4] = [3, 0, 9, 6];
 
+    /// Frames queued for the publisher thread. Bounded, so a stalled network
+    /// can't grow without limit; `try_send` drops instead of blocking, which is
+    /// the right trade for a lossy latest-wins visualization channel.
+    const QUEUE_DEPTH: usize = 8;
+
     pub struct VizPublisher {
-        session: zenoh::Session,
+        /// Handoff to the publisher thread. The control loop only builds a
+        /// frame and `try_send`s it — no serialization, no syscall, no network
+        /// on the 500 Hz path (see `doc/issue.md` 2.1).
+        tx: SyncSender<(String, GaitVizFrame)>,
         key: String,
         /// Measured-stream key; empty = measured frames aren't published.
         key_measured: String,
         seq: u64,
         period: u32, // publish every `period` control ticks
         since: u32,
+        /// Frames dropped because the queue was full — reported on shutdown so
+        /// a silently throttled stream doesn't look like a healthy one.
+        dropped: u64,
     }
 
     impl VizPublisher {
@@ -104,13 +117,31 @@ mod viz_pub {
             } else {
                 key_measured
             };
+            // The session moves to a publisher thread: `put(..).wait()` is a
+            // blocking network call and must not sit in the control loop.
+            let (tx, rx) = sync_channel::<(String, GaitVizFrame)>(QUEUE_DEPTH);
+            std::thread::Builder::new()
+                .name("viz-pub".into())
+                .spawn(move || {
+                    // Ends when the sender is dropped (publisher torn down).
+                    for (key, frame) in rx {
+                        if let Ok(json) = serde_json::to_vec(&frame) {
+                            let _ = session
+                                .put(&key, json)
+                                .encoding(zenoh::bytes::Encoding::APPLICATION_JSON)
+                                .wait();
+                        }
+                    }
+                })
+                .map_err(|e| format!("spawn viz-pub thread: {e}"))?;
             Ok(Self {
-                session,
+                tx,
                 key: key.to_string(),
                 key_measured: key_measured.to_string(),
                 seq: 0,
                 period,
                 since: 0,
+                dropped: 0,
             })
         }
 
@@ -155,7 +186,7 @@ mod viz_pub {
                     frame.joints[3 * slot + k] *= signs[slot][k];
                 }
             }
-            if let (Some(q), Some(key)) = (q_meas, self.key_measured()) {
+            if let (Some(q), Some(key)) = (q_meas, self.key_measured().map(str::to_string)) {
                 let mut meas = frame.clone();
                 for slot in 0..4 {
                     let base = SLOT_BASE_MOTOR[slot];
@@ -163,22 +194,25 @@ mod viz_pub {
                         meas.joints[3 * slot + k] = q[base + k];
                     }
                 }
-                if let Ok(json) = serde_json::to_vec(&meas) {
-                    let _ = self
-                        .session
-                        .put(key, json)
-                        .encoding(zenoh::bytes::Encoding::APPLICATION_JSON)
-                        .wait();
-                }
+                self.hand_off(key, meas);
             }
             self.seq += 1;
-            if let Ok(json) = serde_json::to_vec(&frame) {
-                let _ = self
-                    .session
-                    .put(&self.key, json)
-                    .encoding(zenoh::bytes::Encoding::APPLICATION_JSON)
-                    .wait();
+            let key = self.key.clone();
+            self.hand_off(key, frame);
+        }
+
+        /// Queue one frame for the publisher thread, dropping it if the queue
+        /// is full. Never blocks: a slow or stalled network costs frames, not
+        /// control-loop deadlines.
+        fn hand_off(&mut self, key: String, frame: GaitVizFrame) {
+            if self.tx.try_send((key, frame)).is_err() {
+                self.dropped += 1;
             }
+        }
+
+        /// Frames dropped so far because the publisher thread couldn't keep up.
+        pub fn dropped(&self) -> u64 {
+            self.dropped
         }
     }
 }
@@ -2579,6 +2613,14 @@ fn run_hardware(
         yaw_last.to_degrees()
     );
     eprintln!("  → minimise roll/pitch (sway) and |yaw drift| (off-axis) when tuning.");
+    #[cfg(feature = "viz")]
+    if let Some(v) = viz.as_ref() {
+        eprintln!(
+            "  viz: {} frames dropped (publisher queue full; publishing runs off \
+             the control loop)",
+            v.dropped(),
+        );
+    }
     eprintln!("done: gait complete, folded on the ground.");
     Ok(())
 }
