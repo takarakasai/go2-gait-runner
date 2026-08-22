@@ -226,6 +226,51 @@ const HOME_CALF: f64 = -1.8;
 /// 500 Hz control period.
 const CONTROL_DT: f64 = 0.002;
 
+/// Deadline accounting for the absolute-time paced control loops.
+///
+/// The pacing itself is drift-free (each tick sleeps until `loop_start + n·dt`),
+/// but a tick whose work outran the period silently skips its sleep — so jitter
+/// neither shows up in the wall-clock nor in any counter. This records how often
+/// that happened and the worst lateness, which is what makes a real-time
+/// regression (or a fix) measurable at all (`doc/issue.md` 2.2).
+#[derive(Default)]
+struct PaceStats {
+    ticks: u64,
+    over: u64,
+    worst: Duration,
+}
+
+impl PaceStats {
+    /// Sleep until `next`, or count an overrun when that instant has passed.
+    fn sleep_until(&mut self, next: Instant) {
+        self.ticks += 1;
+        let now = Instant::now();
+        match next.checked_duration_since(now) {
+            Some(d) => std::thread::sleep(d),
+            None => {
+                self.over += 1;
+                self.worst = self.worst.max(now.saturating_duration_since(next));
+            }
+        }
+    }
+
+    fn report(&self) {
+        let pct = if self.ticks > 0 {
+            100.0 * self.over as f64 / self.ticks as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  control loop: {}/{} ticks missed the {:.1} ms deadline ({pct:.2} %), \
+             worst overrun {:.2} ms",
+            self.over,
+            self.ticks,
+            CONTROL_DT * 1e3,
+            self.worst.as_secs_f64() * 1e3,
+        );
+    }
+}
+
 /// Go2 joint limits (rad) from `go2.misa`, indexed hip/thigh/calf.
 const LIMITS: [(f64, f64); 3] = [
     (-1.0472, 1.0472),   // hip
@@ -2075,6 +2120,7 @@ fn run_hardware(
     let mut cmd = init_lowcmd();
     let loop_start = Instant::now();
     let mut tick: u64 = 0;
+    let mut pace = PaceStats::default();
     let mut emit = |q: &[f64; 12], tau: &[f64; 12], kp: f32, kd: f32| -> Result<(), String> {
         for j in 0..joint::NUM_LEG_JOINTS {
             let m = &mut cmd.motor_cmd[j];
@@ -2088,9 +2134,7 @@ fn run_hardware(
         writer.write(&cmd).map_err(|e| format!("write: {e}"))?;
         tick += 1;
         let next = loop_start + Duration::from_secs_f64(CONTROL_DT * tick as f64);
-        if let Some(d) = next.checked_duration_since(Instant::now()) {
-            std::thread::sleep(d);
-        }
+        pace.sleep_until(next);
         Ok(())
     };
     let ticks = |secs: f64| -> u64 { (secs / CONTROL_DT).round().max(1.0) as u64 };
@@ -2613,6 +2657,7 @@ fn run_hardware(
         yaw_last.to_degrees()
     );
     eprintln!("  → minimise roll/pitch (sway) and |yaw drift| (off-axis) when tuning.");
+    pace.report();
     #[cfg(feature = "viz")]
     if let Some(v) = viz.as_ref() {
         eprintln!(
@@ -2771,6 +2816,7 @@ fn run_policy(
     let mut lowcmd = init_lowcmd();
     let loop_start = Instant::now();
     let mut tick: u64 = 0;
+    let mut pace = PaceStats::default();
     let mut emit = |q: &[f64; 12], kpv: f32, kdv: f32| -> Result<(), String> {
         for j in 0..joint::NUM_LEG_JOINTS {
             let m = &mut lowcmd.motor_cmd[j];
@@ -2784,9 +2830,7 @@ fn run_policy(
         writer.write(&lowcmd).map_err(|e| format!("write: {e}"))?;
         tick += 1;
         let next = loop_start + Duration::from_secs_f64(CONTROL_DT * tick as f64);
-        if let Some(d) = next.checked_duration_since(Instant::now()) {
-            std::thread::sleep(d);
-        }
+        pace.sleep_until(next);
         Ok(())
     };
     let ticks = |secs: f64| -> u64 { (secs / CONTROL_DT).round().max(1.0) as u64 };
@@ -3011,6 +3055,7 @@ fn run_policy(
     if let Some(h) = kb_handle {
         let _ = h.join();
     }
+    pace.report();
     eprintln!("policy: done, folded on the ground.");
     Ok(())
 }
