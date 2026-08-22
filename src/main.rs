@@ -22,12 +22,21 @@ use unitree_go2::{
     init_lowcmd, joint, set_crc, topics, LowState, Participant, ReaderQos, WriterQos,
 };
 
-/// Live gait-visualization config (`--viz` / `--viz-key` / `--viz-rate` /
-/// `--viz-endpoint`).
+/// Default Zenoh key for the **measured** (robot read-back) gait stream, the
+/// counterpart to [`quadruped_gait::viz::VIZ_KEY_PLANNED`]. Only a hardware run
+/// has read-back, so only `run`/`diag` publish it.
+const VIZ_KEY_MEASURED: &str = "go2/gait/measured";
+
+/// Live gait-visualization config (`--viz` / `--viz-key` / `--viz-key-measured`
+/// / `--viz-rate` / `--viz-endpoint`).
 #[derive(Clone)]
 struct VizCfg {
     enabled: bool,
     key: String,
+    /// Zenoh key for the **measured** (robot read-back) stream, published
+    /// alongside the commanded one on a hardware run so a viewer can
+    /// superimpose command and response. Empty = don't publish it.
+    key_measured: String,
     rate_hz: f64,
     /// Optional Zenoh **listen** endpoint (e.g. `tcp/0.0.0.0:7447`). Set this
     /// when multicast peer discovery isn't available (same host / WSL2 / no
@@ -43,9 +52,16 @@ mod viz_pub {
     use quadruped_gait::ControllerOutput;
     use zenoh::Wait;
 
+    /// Slot (FL, FR, RL, RR) → base index in Go2 motor order (FR, FL, RR, RL),
+    /// for re-ordering a measured `LowState` q-vector into the frame's slots.
+    /// Same mapping as `leg_base_motor`, indexed by gait slot.
+    const SLOT_BASE_MOTOR: [usize; 4] = [3, 0, 9, 6];
+
     pub struct VizPublisher {
         session: zenoh::Session,
         key: String,
+        /// Measured-stream key; empty = measured frames aren't published.
+        key_measured: String,
         seq: u64,
         period: u32, // publish every `period` control ticks
         since: u32,
@@ -58,6 +74,7 @@ mod viz_pub {
         /// without working multicast (the viewer connects to `ep`).
         pub fn new(
             key: &str,
+            key_measured: &str,
             rate_hz: f64,
             dt: f64,
             endpoint: Option<&str>,
@@ -73,9 +90,24 @@ mod viz_pub {
                 .wait()
                 .map_err(|e| format!("zenoh open: {e}"))?;
             let period = ((1.0 / rate_hz.max(1.0)) / dt).round().max(1.0) as u32;
+            // Both streams on one key would interleave two different poses on
+            // the same latest-wins channel: the viewer would flip between
+            // command and response instead of overlaying them. Drop the
+            // measured stream rather than corrupt the commanded one.
+            let key_measured = if key_measured == key {
+                eprintln!(
+                    "viz: measured key '{key_measured}' is the same as the \
+                     commanded key — measured stream disabled (use \
+                     distinct --viz-key / --viz-key-measured)"
+                );
+                ""
+            } else {
+                key_measured
+            };
             Ok(Self {
                 session,
                 key: key.to_string(),
+                key_measured: key_measured.to_string(),
                 seq: 0,
                 period,
                 since: 0,
@@ -86,6 +118,11 @@ mod viz_pub {
             &self.key
         }
 
+        /// Measured-stream key, or `None` when measured frames aren't published.
+        pub fn key_measured(&self) -> Option<&str> {
+            (!self.key_measured.is_empty()).then_some(self.key_measured.as_str())
+        }
+
         /// Call every control tick; publishes a JSON [`GaitVizFrame`] at the
         /// configured (downsampled) rate. `signs` is the IK→model sign table
         /// (slot × joint, from `joint_signs`): the controller output is in the
@@ -93,12 +130,19 @@ mod viz_pub {
         /// convention — exactly what `output_to_go2` sends to the robot — so a
         /// viewer setting `joint_positions` directly renders the *commanded*
         /// pose (e.g. knees bend `<<`, not the IK-sign-flipped `>>`).
+        /// `q_meas` is the last read-back joint vector in **Go2 motor order**
+        /// (`LowState.motor_state[].q`, already in the model convention); when
+        /// given — and a measured key is set — a second frame carrying it is
+        /// published on that key, same tick, same `seq`, same trunk pose, so a
+        /// viewer can superimpose the commanded pose on the measured one and
+        /// only the joint angles differ.
         pub fn publish(
             &mut self,
             t_s: f64,
             trunk_z: f64,
             out: &ControllerOutput,
             signs: &[[f64; 3]; 4],
+            q_meas: Option<&[f64; 12]>,
         ) {
             self.since += 1;
             if self.since < self.period {
@@ -109,6 +153,22 @@ mod viz_pub {
             for slot in 0..4 {
                 for k in 0..3 {
                     frame.joints[3 * slot + k] *= signs[slot][k];
+                }
+            }
+            if let (Some(q), Some(key)) = (q_meas, self.key_measured()) {
+                let mut meas = frame.clone();
+                for slot in 0..4 {
+                    let base = SLOT_BASE_MOTOR[slot];
+                    for k in 0..3 {
+                        meas.joints[3 * slot + k] = q[base + k];
+                    }
+                }
+                if let Ok(json) = serde_json::to_vec(&meas) {
+                    let _ = self
+                        .session
+                        .put(key, json)
+                        .encoding(zenoh::bytes::Encoding::APPLICATION_JSON)
+                        .wait();
                 }
             }
             self.seq += 1;
@@ -405,6 +465,12 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
                     the articara GUI (key go2/gait/planned, JSON). On `intent`
                     it streams offline in real time (no robot)  [run/diag/intent]
   --viz-key K       Zenoh key to publish on (default go2/gait/planned)
+  --viz-key-measured K  Zenoh key for the measured (read-back) stream, published
+                    alongside the commanded one on `run`/`diag` so the viewer
+                    can overlay command vs. response (default go2/gait/measured;
+                    empty string disables it). Must differ from --viz-key: one
+                    key can't carry both poses (latest-wins), so an equal key
+                    disables the measured stream with a warning.
   --viz-rate HZ     viz publish rate, Hz (default 100)
   --viz-endpoint EP Zenoh listen endpoint (e.g. tcp/0.0.0.0:7447) for hosts
                     without multicast (same PC / WSL2); the viewer connects to
@@ -504,6 +570,10 @@ fn main() {
                     .str("viz-key")
                     .unwrap_or(quadruped_gait::viz::VIZ_KEY_PLANNED)
                     .to_string(),
+                key_measured: cli
+                    .str("viz-key-measured")
+                    .unwrap_or(VIZ_KEY_MEASURED)
+                    .to_string(),
                 rate_hz: cli.f64("viz-rate").unwrap_or(100.0),
                 endpoint: cli.str("viz-endpoint").map(|s| s.to_string()),
             };
@@ -581,6 +651,10 @@ fn main() {
                 key: cli
                     .str("viz-key")
                     .unwrap_or(quadruped_gait::viz::VIZ_KEY_PLANNED)
+                    .to_string(),
+                key_measured: cli
+                    .str("viz-key-measured")
+                    .unwrap_or(VIZ_KEY_MEASURED)
                     .to_string(),
                 rate_hz: cli.f64("viz-rate").unwrap_or(100.0),
                 endpoint: cli.str("viz-endpoint").map(|s| s.to_string()),
@@ -1340,6 +1414,7 @@ fn run_intent(
     if viz_cfg.enabled {
         let mut viz = viz_pub::VizPublisher::new(
             &viz_cfg.key,
+            "", // offline: no robot to read back from
             viz_cfg.rate_hz,
             CONTROL_DT,
             viz_cfg.endpoint.as_deref(),
@@ -1365,7 +1440,7 @@ fn run_intent(
         loop {
             let out = ctrl.tick(CONTROL_DT);
             t += CONTROL_DT;
-            viz.publish(t, trunk_z, &out, &signs);
+            viz.publish(t, trunk_z, &out, &signs, None);
             std::thread::sleep(std::time::Duration::from_secs_f64(CONTROL_DT));
         }
     }
@@ -2271,6 +2346,11 @@ fn run_hardware(
     // Declared before the macros so they capture it (macro_rules hygiene
     // resolves outer identifiers at the definition site).
     let mut last_rpy = [0.0f64; 3];
+    // Latest measured joint angles in Go2 motor order — the read-back the viz
+    // publisher streams on the measured key alongside the commanded pose.
+    // `None` until the first state poll, so no zeroed pose is ever streamed.
+    #[cfg(feature = "viz")]
+    let mut last_q_meas: Option<[f64; 12]> = None;
 
     // Closed-loop observer for the MPC gait modes (no-op for the open-loop
     // CHAMP / LinearCrawl). `kin_obs` is cloned so the observer can borrow it
@@ -2295,14 +2375,18 @@ fn run_hardware(
     let mut viz = if viz_cfg.enabled {
         match viz_pub::VizPublisher::new(
             &viz_cfg.key,
+            &viz_cfg.key_measured,
             viz_cfg.rate_hz,
             CONTROL_DT,
             viz_cfg.endpoint.as_deref(),
         ) {
             Ok(v) => {
                 eprintln!(
-                    "viz: publishing gait frames on zenoh key '{}' (~{} Hz){}",
+                    "viz: publishing gait frames on zenoh key '{}'{} (~{} Hz){}",
                     v.key(),
+                    v.key_measured()
+                        .map(|k| format!(" + measured on '{k}'"))
+                        .unwrap_or_default(),
                     viz_cfg.rate_hz,
                     viz_cfg
                         .endpoint
@@ -2342,7 +2426,7 @@ fn run_hardware(
             {
                 viz_t += CONTROL_DT;
                 if let Some(v) = viz.as_mut() {
-                    v.publish(viz_t, viz_trunk_z, &out, &signs);
+                    v.publish(viz_t, viz_trunk_z, &out, &signs, last_q_meas.as_ref());
                 }
             }
             let mut q = output_to_go2(&out, &signs)?;
@@ -2394,6 +2478,10 @@ fn run_hardware(
                     st.imu_state.rpy[1] as f64,
                     st.imu_state.rpy[2] as f64,
                 ];
+                #[cfg(feature = "viz")]
+                {
+                    last_q_meas = Some(std::array::from_fn(|j| st.motor_state[j].q as f64));
+                }
                 // Feed the MPC modes their closed-loop state (no-op otherwise).
                 observer.feed(&mut ctrl, st, &kin_obs, &signs, &last_stance, CONTROL_DT);
             }
