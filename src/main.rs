@@ -27,11 +27,67 @@ use unitree_go2::{
 /// has read-back, so only `run`/`diag` publish it.
 const VIZ_KEY_MEASURED: &str = "go2/gait/measured";
 
+/// Swap the robot identifier — the leading chunk of a viz key — for `robot`,
+/// so one flag re-namespaces both streams (`<robot>/gait/<stream>`; see
+/// `quadruped-gait`'s `doc/viz_publisher.md` §5.4). A key with no `/` is
+/// replaced wholesale, which is the degenerate case of the same rule.
+fn with_robot(key: &str, robot: &str) -> String {
+    match key.split_once('/') {
+        Some((_, rest)) => format!("{robot}/{rest}"),
+        None => robot.to_string(),
+    }
+}
+
+/// Build the viz config from the CLI, resolving `--viz-robot` into both keys.
+/// Exits on a robot name that cannot be a key chunk — publishing to a
+/// surprising key is worse than not starting.
+fn viz_cfg_from(cli: &Cli) -> VizCfg {
+    let robot = cli.str("viz-robot");
+    if let Some(r) = robot {
+        if let Err(e) = check_robot_name(r) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+    let resolve = |key: &str| match robot {
+        Some(r) => with_robot(key, r),
+        None => key.to_string(),
+    };
+    VizCfg {
+        enabled: cli.flag("viz"),
+        key: resolve(
+            cli.str("viz-key")
+                .unwrap_or(quadruped_gait::viz::VIZ_KEY_PLANNED),
+        ),
+        key_measured: resolve(cli.str("viz-key-measured").unwrap_or(VIZ_KEY_MEASURED)),
+        rate_hz: cli.f64("viz-rate").unwrap_or(100.0),
+        endpoint: cli.str("viz-endpoint").map(|s| s.to_string()),
+    }
+}
+
+/// Reject a robot identifier that can't be a Zenoh key chunk. `/` would add a
+/// level, and `* ? # $` are the wildcard / reserved characters — either way the
+/// resulting key is not what the operator meant, so say so instead of
+/// publishing somewhere surprising.
+fn check_robot_name(robot: &str) -> Result<(), String> {
+    if robot.is_empty() {
+        return Err("--viz-robot must not be empty".to_string());
+    }
+    if let Some(c) = robot.chars().find(|c| "/*?#$".contains(*c)) {
+        return Err(format!(
+            "--viz-robot '{robot}' contains '{c}', which a Zenoh key chunk \
+             cannot hold (use [a-z0-9-])"
+        ));
+    }
+    Ok(())
+}
+
 /// Live gait-visualization config (`--viz` / `--viz-key` / `--viz-key-measured`
 /// / `--viz-rate` / `--viz-endpoint`).
 #[derive(Clone)]
 struct VizCfg {
     enabled: bool,
+    /// Fully resolved key, `--viz-robot` already folded in — see `viz_cfg_from`.
     key: String,
     /// Zenoh key for the **measured** (robot read-back) stream, published
     /// alongside the commanded one on a hardware run so a viewer can
@@ -560,6 +616,10 @@ FLAGS (all optional; <iface> is the 1st positional for run/diag):
   --viz             stream the generated gait over Zenoh for live viewing in
                     the articara GUI (key go2/gait/planned, JSON). On `intent`
                     it streams offline in real time (no robot)  [run/diag/intent]
+  --viz-robot NAME  robot identifier for the key namespace <robot>/gait/<stream>;
+                    replaces the leading chunk of both viz keys. Use it to tell
+                    machines of the same model apart (go2-01, go2-02). Chars:
+                    no / * ? # $ (Zenoh key chunk)
   --viz-key K       Zenoh key to publish on (default go2/gait/planned)
   --viz-key-measured K  Zenoh key for the measured (read-back) stream, published
                     alongside the commanded one on `run`/`diag` so the viewer
@@ -660,19 +720,7 @@ fn main() {
             // With `--viz` it then streams the gait in real time (no robot) so
             // the articara GUI can preview it.
             let vx = cli.f64("vx").unwrap_or(0.05);
-            let viz_cfg = VizCfg {
-                enabled: cli.flag("viz"),
-                key: cli
-                    .str("viz-key")
-                    .unwrap_or(quadruped_gait::viz::VIZ_KEY_PLANNED)
-                    .to_string(),
-                key_measured: cli
-                    .str("viz-key-measured")
-                    .unwrap_or(VIZ_KEY_MEASURED)
-                    .to_string(),
-                rate_hz: cli.f64("viz-rate").unwrap_or(100.0),
-                endpoint: cli.str("viz-endpoint").map(|s| s.to_string()),
-            };
+            let viz_cfg = viz_cfg_from(&cli);
             if let Err(e) = run_intent(&misa, vx, tune, &viz_cfg) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -742,19 +790,7 @@ fn main() {
             } else {
                 None
             };
-            let viz_cfg = VizCfg {
-                enabled: cli.flag("viz"),
-                key: cli
-                    .str("viz-key")
-                    .unwrap_or(quadruped_gait::viz::VIZ_KEY_PLANNED)
-                    .to_string(),
-                key_measured: cli
-                    .str("viz-key-measured")
-                    .unwrap_or(VIZ_KEY_MEASURED)
-                    .to_string(),
-                rate_hz: cli.f64("viz-rate").unwrap_or(100.0),
-                endpoint: cli.str("viz-endpoint").map(|s| s.to_string()),
-            };
+            let viz_cfg = viz_cfg_from(&cli);
 
             // Deactivate sport_mode before low-level control unless told not to.
             // Without this the onboard controller fights rt/lowcmd and the joints
@@ -3129,6 +3165,32 @@ mod tests {
     use super::*;
 
     const GO2_MISA: &str = "models/unitree_go2/go2.misa";
+
+    /// `--viz-robot` renames only the leading chunk, so machines of the same
+    /// model land on separate key spaces while the rest of the key — the part
+    /// the viewer matches on — is untouched.
+    #[test]
+    fn viz_robot_replaces_the_leading_key_chunk() {
+        assert_eq!(with_robot("go2/gait/planned", "go2-01"), "go2-01/gait/planned");
+        assert_eq!(
+            with_robot(VIZ_KEY_MEASURED, "spot"),
+            "spot/gait/measured",
+            "both streams re-namespace the same way"
+        );
+        // Degenerate: a single-chunk key is the robot chunk itself.
+        assert_eq!(with_robot("planned", "go2-01"), "go2-01");
+    }
+
+    /// A name that cannot be a Zenoh key chunk must be refused rather than
+    /// publishing somewhere the operator did not ask for.
+    #[test]
+    fn viz_robot_rejects_names_a_key_chunk_cannot_hold() {
+        assert!(check_robot_name("go2-01").is_ok());
+        assert!(check_robot_name("").is_err(), "empty");
+        for bad in ["go2/01", "go2*", "go2?", "go2#", "go2$*"] {
+            assert!(check_robot_name(bad).is_err(), "{bad} must be refused");
+        }
+    }
 
     fn crawl_tune() -> GaitTune {
         GaitTune {
