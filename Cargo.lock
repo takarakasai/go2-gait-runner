@@ -777,7 +777,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1209,10 +1209,8 @@ dependencies = [
  "nalgebra",
  "policy-runtime",
  "quadruped-gait",
- "serde_json",
  "unitree-go2",
  "unitree-rpc",
- "zenoh",
 ]
 
 [[package]]
@@ -2435,7 +2433,7 @@ dependencies = [
 [[package]]
 name = "policy-runtime"
 version = "0.1.0"
-source = "git+https://github.com/takarakasai/quadruped-gait.git#1500accd26759c3167d90104121c1608659e1f2d"
+source = "git+https://github.com/takarakasai/quadruped-gait.git#4d3f6edacee468fe5cda69c994aea95e62b6541d"
 dependencies = [
  "tract-onnx",
 ]
@@ -2542,7 +2540,7 @@ dependencies = [
 [[package]]
 name = "quadruped-gait"
 version = "0.1.0"
-source = "git+https://github.com/takarakasai/quadruped-gait.git#1500accd26759c3167d90104121c1608659e1f2d"
+source = "git+https://github.com/takarakasai/quadruped-gait.git#4d3f6edacee468fe5cda69c994aea95e62b6541d"
 dependencies = [
  "clarabel",
  "log",
@@ -2550,6 +2548,8 @@ dependencies = [
  "misarta",
  "nalgebra",
  "serde",
+ "serde_json",
+ "zenoh",
 ]
 
 [[package]]
@@ -2917,7 +2917,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2984,7 +2984,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4487,7 +4487,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
